@@ -7,11 +7,9 @@ textures — reverse-engineered from the game's proprietary binary formats.
 No intermediate `.obj`/`.mtl`/`.png` files are produced: meshes, materials
 and images are built natively in Blender via `bmesh` and the shader node
 system.
-
 ![Demo4](pics/Screen4.gif)
 
 ![Demo6](pics/Screen6.gif)
-
 ## Features
 
 - Parses `.wrl` world files (entity container format) and places every
@@ -34,7 +32,7 @@ system.
 - Per-import options to skip specific entity types/objects (e.g. `cThePits`,
   `plasball` pickups).
 
-![Demo3](pics/Screen3.gif)
+![Demo3](pics/Screen7.gif)
 
 
 
@@ -75,7 +73,7 @@ In the import options panel (bottom-left of the file browser), set:
 
 ![Demo02](pics/Screen02.jpg)
 
-![Demo1](pics/Screen1.gif)
+
 ## How it works (short version)
 
 - `.wrl` files are a binary entity container (not VRML, despite the
@@ -91,13 +89,13 @@ In the import options panel (bottom-left of the file browser), set:
 - `.MIP` texture files are byte-for-byte the classic Truevision TGA format,
   just renamed. Supported subset: uncompressed types 1 (paletted) and 2
   (true-colour), 24 or 32 bit.
+![Demo1](pics/Screen1.gif)
+
+![Demo1](pics/Screen8.gif)
 
 ## Known limitations
 
-- **Terrain texture filenames are assumed to be `TEXTURE<index+1>.MIP`**
-  (0-based index in the file, 1-based filename) — confirmed against the
-  Whirled source, but if a level uses a different naming convention for
-  its terrain textures this will fail to resolve them.
+-
 - **Models use only their first (dominant) texture layer** — MDL2 render
   groups support up to 4 blended texture layers like terrain does, but
   this addon currently only samples the first one. Terrain, which needed
