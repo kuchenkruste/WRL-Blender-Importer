@@ -7,9 +7,11 @@ textures — reverse-engineered from the game's proprietary binary formats.
 No intermediate `.obj`/`.mtl`/`.png` files are produced: meshes, materials
 and images are built natively in Blender via `bmesh` and the shader node
 system.
+
 ![Demo4](pics/Screen4.gif)
 
 ![Demo6](pics/Screen6.gif)
+
 ## Features
 
 - Parses `.wrl` world files (entity container format) and places every
@@ -95,7 +97,7 @@ In the import options panel (bottom-left of the file browser), set:
 
 ## Known limitations
 
--
+
 - **Models use only their first (dominant) texture layer** — MDL2 render
   groups support up to 4 blended texture layers like terrain does, but
   this addon currently only samples the first one. Terrain, which needed
