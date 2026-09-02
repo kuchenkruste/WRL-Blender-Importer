@@ -7,9 +7,9 @@ textures — reverse-engineered from the game's proprietary binary formats.
 No intermediate `.obj`/`.mtl`/`.png` files are produced: meshes, materials
 and images are built natively in Blender via `bmesh` and the shader node
 system.
-![[Screen4.gif]]
+![Demo4](pics/Screen4.gif)
 
-![[Screen6.gif]]
+![Demo6](pics/Screen6.gif)
 ## Features
 
 - Parses `.wrl` world files (entity container format) and places every
@@ -32,7 +32,7 @@ system.
 - Per-import options to skip specific entity types/objects (e.g. `cThePits`,
   `plasball` pickups).
 
-![[Screen3.gif]]
+![Demo3](pics/Screen3.gif)
 
 
 
@@ -55,7 +55,7 @@ system.
 **File → Import → LEGO Racers 2 World (.wrl)**, then pick a `.wrl` file
 (typically under `GAMEDATA\...\SAVED WORLDS\`).
 
-![[Screenshot 2026-09-02 100806.png]]
+![Demo01](pics/Screen01.png)
 
 In the import options panel (bottom-left of the file browser), set:
 
@@ -68,9 +68,9 @@ In the import options panel (bottom-left of the file browser), set:
 | **Skip 'The Pits' Objects** | Excludes `cThePits` entities. |
 | **Skip Plasball Pickups** | Excludes weapon pickup objects named "plasball". |
 | **Group Paired Layers into Zones** | Nests `Layer_<n>` collections that appear to share a route/zone under a common `Zone_<n>` collection. |
-![[Screenshot 2026-09-02 100850-2.jpg]]
+![Demo02](pics/Screen02.jpg)
 
-![[Screen1.gif]]
+![Demo1](pics/Screen1.gif)
 ## How it works (short version)
 
 - `.wrl` files are a binary entity container (not VRML, despite the
@@ -107,7 +107,8 @@ In the import options panel (bottom-left of the file browser), set:
 - **`binding` cross-references are resolved by exact name match** and
   assume names are unique within a given `.wrl` file.
 
-![[Screen2.gif]]
+
+![Demo2](pics/Screen2.gif)
 ## Credits & sources
 
 This addon builds on the work of several people who reverse-engineered
