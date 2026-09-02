@@ -7,9 +7,11 @@ textures — reverse-engineered from the game's proprietary binary formats.
 No intermediate `.obj`/`.mtl`/`.png` files are produced: meshes, materials
 and images are built natively in Blender via `bmesh` and the shader node
 system.
+
 ![Demo4](pics/Screen4.gif)
 
 ![Demo6](pics/Screen6.gif)
+
 ## Features
 
 - Parses `.wrl` world files (entity container format) and places every
@@ -60,14 +62,17 @@ system.
 In the import options panel (bottom-left of the file browser), set:
 
 
-| Option | Description |
-|---|---|
-| **GAMEDATA Folder** | Root of your extracted game data. Required. |
-| **Convert Axes** | Converts LR2's Y-up coordinate system to Blender's Z-up. Leave on unless you have a specific reason not to. |
-| **Import Terrain** | Also imports the level's terrain heightmap. |
-| **Skip 'The Pits' Objects** | Excludes `cThePits` entities. |
-| **Skip Plasball Pickups** | Excludes weapon pickup objects named "plasball". |
-| **Group Paired Layers into Zones** | Nests `Layer_<n>` collections that appear to share a route/zone under a common `Zone_<n>` collection. |
+| Option                             | Description                                                                                                 |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| **GAMEDATA Folder**                | Root of your extracted game data. Required.                                                                 |
+| **Convert Axes**                   | Converts LR2's Y-up coordinate system to Blender's Z-up. Leave on unless you have a specific reason not to. |
+| **Import Terrain**                 | Also imports the level's terrain heightmap.                                                                 |
+| **Skip 'The Pits' Objects**        | Excludes `cThePits` entities.                                                                               |
+| **Skip Plasball Pickups**          | Excludes weapon pickup objects named "plasball".                                                            |
+| **Group Paired Layers into Zones** | Nests `Layer_<n>` collections that appear to share a route/zone under a common `Zone_<n>` collection.       |
+
+
+
 ![Demo02](pics/Screen02.jpg)
 
 ![Demo1](pics/Screen1.gif)
@@ -107,8 +112,6 @@ In the import options panel (bottom-left of the file browser), set:
 - **`binding` cross-references are resolved by exact name match** and
   assume names are unique within a given `.wrl` file.
 
-
-![Demo2](pics/Screen2.gif)
 ## Credits & sources
 
 This addon builds on the work of several people who reverse-engineered
