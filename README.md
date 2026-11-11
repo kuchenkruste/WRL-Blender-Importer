@@ -58,8 +58,9 @@ v1.3.0 - Changes by Fluffy Cupcake:
 
 ## Requirements
 
-- Blender 3.2 or later (developed and tested on **3.2**; later 3.x and 4.x
-  versions should theoretically work but have not been verified).
+- v1.0.0 was developed and tested on **Blender 3.2**; later 3.x and 4.x
+  versions should theoretically work but have not been verified.
+- v1.3.0 was tested on **Blender 4.5.14 LTS**, aswell as other 4.X and 5.X versions
 - A legally owned copy of LEGO Racers 2, with its `GAMEDATA.GTC` archive
   already extracted (e.g. via [UNGTC](https://github.com/JrMasterModelBuilder/UNGTC))
   into a folder on disk.
