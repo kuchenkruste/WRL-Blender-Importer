@@ -12,7 +12,25 @@ system.
 
 ![Demo6](pics/Screen6.gif)
 
-## Features
+## Change Notes
+
+v1.3.0 - Changes by Fluffy Cupcake:
+
+- Supports land patches (cPatch)
+- Supports Sea (cSea)
+- Supports WaterCourse (cWaterCourse)
+- Supports Water Planes (cWaterSheet)
+- Has the correct X axis (AXIS_MATRIX)
+- Game Data path is auto-detected based on the selected WRL
+- Replaced the "skip plasball" toggle with "skip races" (works via layer detection)
+- MDL0 patch-model parser (parse_mdl0) and MDL0 dispatch in parse_mdl2
+- IFL image-sequence resolution for Sea textures
+- Import log file (<world>_lr2_import.log) and extended diagnostics
+- New import options (Sea Texture Tiles, WaterCourse UV factors)
+- Triangle winding order changed in build_object
+- Model parse/"not found" messages are now only logged for cPatch models
+
+## Main Features
 
 - Parses `.wrl` world files (entity container format) and places every
   referenced object at its correct position, rotation and scale.
@@ -117,6 +135,7 @@ In the import options panel (bottom-left of the file browser), set:
 This addon builds on the work of several people who reverse-engineered
 LEGO Racers 2's file formats before this project existed:
 
+- **Fluffy Cupcake** – extended the importer for version 1.3.0
 - **[GiantBlargg](https://github.com/GiantBlargg)** — author of
   [Whirled](https://github.com/GiantBlargg/Whirled), a Godot-based LR2
   viewer whose C++ source (`wrl.cpp`, `wrl_formats.cpp`, `mdl2.cpp`,
