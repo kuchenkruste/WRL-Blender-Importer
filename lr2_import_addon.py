@@ -1,7 +1,8 @@
 # ==========================================================================
 # LEGO Racers 2 World Importer for Blender
 #
-# Copyright (C) 2026  [Your Name Here]
+# Copyright (C) 2026  Kuchenkruste
+# Copyright (C) 2026  Fluffy Cupcake (modifications, see "Modification notices" below)
 #
 # This program is free software: you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -50,16 +51,44 @@
 # by it. LEGO Racers 2 game assets are copyrighted by their original
 # rights holders and are not included with, nor required to be
 # distributed alongside, this addon's source code.
+#
+# --------------------------------------------------------------------------
+# Modification notices (GNU GPL v3, Section 5(a))
+#
+# This file is a modified version of "lr2_import_addon.py" (version 1.0.0,
+# author "Kuchenkruste"). It was modified by "Fluffy Cupcake" on 18.09.2026
+# (18 September 2026) and carries version number 1.3.0 as a result.
+# Every modified or added passage is marked in the source with a comment
+# containing "[Fluffy Cupcake, 18.09.2026]" (CHANGED / BEGIN ... END).
+#
+# Changes by Fluffy Cupcake:
+#   * Supports land patches (cPatch)
+#   * Supports Sea (cSea)
+#   * Supports WaterCourse (cWaterCourse)
+#   * Supports Water Planes (cWaterSheet)
+#   * Has the correct X axis (AXIS_MATRIX)
+#   * Game Data path is auto-detected based on the selected WRL
+#   * Replaced the "skip plasball" toggle with "skip races" (works via
+#     layer detection)
+#   * MDL0 patch-model parser (parse_mdl0) and MDL0 dispatch in parse_mdl2
+#   * IFL image-sequence resolution for Sea textures
+#   * Import log file (<world>_lr2_import.log) and extended diagnostics
+#   * New import options (Sea Texture Tiles, WaterCourse UV factors)
+#   * Triangle winding order changed in build_object
+#   * Model parse/"not found" messages are now only logged for cPatch models
+#
+#   NOTE: According to the author, only tested with Blender 4.5.14 LTS
 # ==========================================================================
 
 bl_info = {
     "name": "LEGO Racers 2 World Importer",
-    "author": "lr2-tools",
-    "version": (1, 0, 0),
+    "author": "Kuchenkruste",
+    # [Fluffy Cupcake, 18.09.2026] CHANGED: version 1.0.0 -> 1.3.0; "description" below was also rewritten (WaterCourse).
+    "version": (1, 3, 0),
     "blender": (3, 2, 0),
     "location": "File > Import > LEGO Racers 2 World (.wrl)",
     "description": "Imports LR2 .wrl worlds (models + terrain + textures) directly, "
-                   "reverse-engineered from the Whirled project and LibLR2.dll.",
+                   "including procedural cWaterCourse geometry using recovered LR2 Bezier/grid construction.",
     "category": "Import-Export",
 }
 
@@ -68,12 +97,48 @@ import bmesh
 import math
 import os
 import struct
+# [Fluffy Cupcake, 18.09.2026] CHANGED: new import (used by the added error logging).
+import traceback
 from pathlib import Path
 
-from bpy.props import BoolProperty, StringProperty
+# [Fluffy Cupcake, 18.09.2026] CHANGED: FloatProperty added (new Sea/WaterCourse import options).
+from bpy.props import BoolProperty, FloatProperty, StringProperty
 from bpy_extras.io_utils import ImportHelper
 
 
+# >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: import log file helpers (set_import_log, log).
+# ==========================================================================
+# Import diagnostics
+# ==========================================================================
+
+_LOG_FILE = None
+_LOG_LINES = []
+
+
+def set_import_log(path):
+    global _LOG_FILE, _LOG_LINES
+    _LOG_FILE = Path(path) if path else None
+    _LOG_LINES = []
+    if _LOG_FILE:
+        try:
+            _LOG_FILE.write_text("", encoding="utf-8")
+        except OSError:
+            pass
+
+
+def log(msg):
+    text = str(msg)
+    _LOG_LINES.append(text)
+    print(text)
+    if _LOG_FILE:
+        try:
+            with _LOG_FILE.open("a", encoding="utf-8") as fp:
+                fp.write(text + "\n")
+        except OSError:
+            pass
+
+
+# <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: import log file helpers.
 # ==========================================================================
 # Binary read helpers
 # ==========================================================================
@@ -128,7 +193,8 @@ def read_colour(f):
 # Coordinate conversion (LR2 Y-up -> Blender Z-up), pure math, no bpy needed
 # ==========================================================================
 
-AXIS_MATRIX = ((-1, 0, 0), (0, 0, 1), (0, 1, 0))
+# [Fluffy Cupcake, 18.09.2026] CHANGED: X axis corrected (previously ((-1, 0, 0), (0, 0, 1), (0, 1, 0))).
+AXIS_MATRIX = ((1, 0, 0), (0, 0, 1), (0, 1, 0))
 
 
 def mat3_transpose(m):
@@ -247,6 +313,56 @@ _TERRAIN_PROPS = (
 _reg("cLegoTerrain", 3, _TERRAIN_PROPS, "model")
 _reg("cSkyBox", 0, [("binding", "string", 24), ("model", "string", 0x80)], "model")
 
+# >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: cPatch, cWaterCourse, cSea and cWaterSheet entity registrations.
+# cPatch / OBMGcPatch (land patches, e.g. Arctic ice sheets).
+# The transform is the standard position/rotation/scale sequence in the
+# payload. A 32-bit value follows the scale at payload 0x58; the model path
+# is then stored as a fixed 0x80-byte string beginning at payload 0x5C.
+
+_reg("cPatch", 4, [], None)
+
+# cWaterCourse / OBMGcWaterCourse (procedural flat water ribbons).
+# The supplied DINO WRLs use u=0. The payload has two 0x80-byte texture
+# fields, followed by a course-level vec3 and several material/runtime fields.
+# The experimentally confirmed geometry section is:
+#   payload + 0x1B4 : u32 point count
+#   payload + 0x1B8 : point[0]
+#   point stride     : 20 bytes
+#   point            : float x, y, z, float unknown(usually 1.0), float width
+_reg("cWaterCourse", 0, [], None)
+
+# cSea documented layout (offsets include the entity header):
+# Binding 40-57, material 70-?, Height 170-173, Rise/Lower 174-177,
+# Fade Out 178-17B, RGBS Tint 17C-17F.
+_SEA_PROPS = [
+    ("binding", "string", 24),       # 40-57
+    ("_sea_ref", "string", 24),      # 58-6F
+    ("sea_texture", "string", 0x80), # 70-EF
+    ("_sea_unknown", "bytes", 0x80),
+    ("sea_height", "float", None),
+    ("sea_rise_lower", "float", None),
+    ("sea_fade_distance", "float", None),
+    ("sea_rgb_s", "bytes", 4),
+    ("_sea_tail", "bytes", 4),
+]
+_reg("cSea", 2, _SEA_PROPS, None)
+
+# Water sheets are procedural planes stored directly in the WRL rather than MD2 models.
+# The 24-byte field between the name and texture paths is currently undocumented.
+_WATER_SHEET_PROPS = [
+    ("_water_unknown", "bytes", 24),
+    ("water_texture", "string", 0x80),
+    ("reflection_texture", "string", 0x80),
+    ("position", "vec3", None),
+    ("rotation", "quat", None),
+    ("_water_unknown2", "bytes", 8),
+    ("width", "float", None),
+    ("height", "float", None),
+    ("_water_unknown3", "bytes", 116),
+]
+_reg("cWaterSheet", 2, _WATER_SHEET_PROPS, None)
+
+# <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: entity registrations.
 WRL_MAGIC = 0x57324352
 WRL_VERSION = 0xB
 OBMG_MAGIC = 0x474D424F
@@ -276,9 +392,148 @@ def _read_prop(f, kind, length):
         return read_vec3(f)
     if kind == "quat":
         return read_quat(f)
+    # [Fluffy Cupcake, 18.09.2026] CHANGED: new property kind "bytes" (raw byte fields).
+    if kind == "bytes":
+        return f.read(length)
     raise ValueError(f"Unknown property kind: {kind}")
 
 
+# >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: parsers for cPatch (land patch) and cWaterCourse.
+def _parse_cpatch(f, next_chunk):
+    """Parse OBMGcPatch / cPatch.
+
+    Verified payload layout in the supplied Arctic.wrl cPatch records:
+      0x00  layer (i32)
+      0x04  name[24]
+      0x1C  binding[24]
+      0x34  position[3]
+      0x40  rotation quaternion[4]
+      0x50  scale[2] (X/Y only)
+      0x58  unknown u32 (currently 13 in the Arctic records)
+      0x5C  model path[0x80]
+
+    The remaining bytes are editor/material metadata and are retained as
+    raw data rather than guessed at.
+    """
+    props = {}
+    props["layer"] = read_i32(f)
+    props["name"] = read_string(f, 24)
+    props["binding"] = read_string(f, 24)
+    props["position"] = read_vec3(f)
+    props["rotation"] = read_quat(f)
+
+    # cPatch stores only planar X/Y scale here. The next DWORD at 0x58 is
+    # separate metadata, followed immediately by the fixed 0x80-byte path.
+    # Reading a third scale float consumes those metadata bytes and shifts
+    # the path, which was the source of the truncated "itor gen\patches..."
+    # reference and the absurd scale values seen in the previous log.
+    sx = read_f32(f)
+    sy = read_f32(f)
+    props["scale"] = (sx, sy, 1.0)
+    props["_patch_model_meta"] = read_u32(f)
+    props["model"] = read_string(f, 0x80).strip()
+    log(f"[LR2 Parse] cPatch name={props['name']!r} layer={props['layer']} "
+        f"pos={props['position']} scale={props['scale']} "
+        f"meta={props['_patch_model_meta']} model={props['model']!r}")
+
+    # Preserve the remaining editor/material data for diagnostics without
+    # interpreting undocumented fields.
+    props["_patch_raw"] = f.read(max(0, next_chunk - f.tell()))
+    return props
+
+
+
+def _parse_cwatercourse(f, next_chunk):
+    """Parse cWaterCourse using the recovered LibLR2 field order.
+
+    Payload layout relative to the start of the entity data:
+      0x00  layer
+      0x04  name[24]
+      0x1C  binding[24]
+      0x34  BottomTexturePath[0x80]
+      0xB4  TopTexturePath[0x80]
+      0x134 Position[3 floats]
+      0x140 MatProps[0x58 bytes]
+      0x198 BottomLayerSpeed
+      0x19C TopLayerSpeed
+      0x1A0 Wavyness
+      0x1A4 TextureDisturbance
+      0x1A8 TransparentEdges
+      0x1AC GridResolution
+      0x1B0 FlowDirection
+      0x1B4 ControlPoint count
+      0x1B8 ControlPoints, 20 bytes each:
+            Vec3 Position, float VOffset, float Width
+
+    The 0x58-byte MatProps block is intentionally left as raw bytes here;
+    its structure is defined by LibLR2 separately from WaterCourse itself.
+    """
+    start = f.tell()
+
+    def at(offset, reader):
+        here = f.tell()
+        f.seek(start + offset)
+        value = reader()
+        f.seek(here)
+        return value
+
+    props = {}
+    props["layer"] = at(0x00, lambda: read_i32(f))
+    props["name"] = at(0x04, lambda: read_string(f, 24))
+    props["binding"] = at(0x1C, lambda: read_string(f, 24))
+    props["bed_texture"] = at(0x34, lambda: read_string(f, 0x80)).strip()
+    props["water_texture"] = at(0xB4, lambda: read_string(f, 0x80)).strip()
+    props["course_ref"] = at(0x134, lambda: read_vec3(f))
+    props["matprops_raw"] = at(0x140, lambda: f.read(0x58))
+    # MatProps +0x40 (course payload 0x180) is the empirically verified
+    # water-course texture tiling field (100.0 in both DINO courses).
+    props["texture_tiling"] = at(0x180, lambda: read_f32(f))
+    props["texture_tiling_aux"] = at(0x184, lambda: read_f32(f))
+    props["bottom_layer_speed"] = at(0x198, lambda: read_f32(f))
+    props["top_layer_speed"] = at(0x19C, lambda: read_f32(f))
+    props["wavyness"] = at(0x1A0, lambda: read_f32(f))
+    props["texture_disturbance"] = at(0x1A4, lambda: read_f32(f))
+    props["transparent_edges"] = at(0x1A8, lambda: read_u32(f))
+    props["grid_resolution"] = at(0x1AC, lambda: read_i32(f))
+    props["flow_direction"] = at(0x1B0, lambda: read_u32(f))
+    point_count = at(0x1B4, lambda: read_i32(f))
+
+    point_start = start + 0x1B8
+    max_points = max(0, (next_chunk - point_start) // 20)
+    if point_count < 0:
+        point_count = 0
+    if point_count > max_points:
+        log(f"[LR2 Parse] cWaterCourse {props['name']!r}: point count {point_count} exceeds "
+            f"chunk capacity {max_points}; clamping")
+        point_count = max_points
+
+    points = []
+    f.seek(point_start)
+    for _ in range(point_count):
+        pos = read_vec3(f)
+        v_offset = read_f32(f)
+        width = read_f32(f)
+        points.append({
+            "position": pos,
+            "v_offset": v_offset,
+            "width": width,
+        })
+
+    props["points"] = points
+    props["point_count"] = len(points)
+
+    log(f"[LR2 Parse] cWaterCourse name={props['name']!r} layer={props['layer']} "
+        f"points={len(points)} grid_res={props['grid_resolution']} flow_dir={props['flow_direction']} "
+        f"bottom_speed={props['bottom_layer_speed']:.6g} top_speed={props['top_layer_speed']:.6g} "
+        f"wave={props['wavyness']:.6g} disturbance={props['texture_disturbance']:.6g} "
+        f"texture_tiling={props['texture_tiling']:.6g}")
+
+    f.seek(start)
+    props["_course_raw"] = f.read(max(0, next_chunk - start))
+    f.seek(next_chunk)
+    return props
+
+# <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: cPatch / cWaterCourse parsers.
 def parse_wrl(path):
     entities = []
     with open(path, "rb") as f:
@@ -302,7 +557,12 @@ def parse_wrl(path):
 
             spec = WRL_FORMATS.get((type_id, u))
             props = {}
-            if spec is not None:
+            # [Fluffy Cupcake, 18.09.2026] CHANGED: cPatch and cWaterCourse are routed to their own parsers (next 4 lines); the former 'if spec is not None' became 'elif'.
+            if type_id == "cPatch":
+                props = _parse_cpatch(f, next_chunk)
+            elif type_id == "cWaterCourse":
+                props = _parse_cwatercourse(f, next_chunk)
+            elif spec is not None:
                 for name, kind, length_arg in spec["props"]:
                     props[name] = _read_prop(f, kind, length_arg)
             else:
@@ -319,7 +579,8 @@ def parse_wrl(path):
 
 
 # ==========================================================================
-# MDL2 (.md2) model parsing
+# [Fluffy Cupcake, 18.09.2026] CHANGED: section title extended to MDL0 (was 'MDL2 (.md2) model parsing').
+# MDL2 / MDL0 (.md2) model parsing
 # ==========================================================================
 
 MDL2_END = 0
@@ -364,7 +625,142 @@ def _load_mdl2_vertices(f):
     return vectors, normals, uvs
 
 
+
+# >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: new MDL0 patch-model parser (parse_mdl0).
+def parse_mdl0(path):
+    """Parse the LR2/ATD MDL0 patch model format.
+
+    MDL0 is a simpler, sequential model format than MDL2.  LR2 uses it for
+    editor-generated patch meshes.  The important wrinkle for Arctic patches
+    is fill_type == 1: the polygon stream is a triangle strip, so it contains
+    (polygon_count + 2) vertex records rather than polygon_count * 3 records.
+    """
+    surfaces = []
+    with open(path, "rb") as f:
+        magic = f.read(4)
+        if magic != b"MDL0":
+            raise ValueError(f"Not an MDL0 file: {magic!r}")
+
+        # Header used by the LR2 MDL0 files.  These are little-endian.
+        _zero0, _zero1, _zero2, _float0, bitmap_count = struct.unpack(
+            "<3IfI", f.read(20)
+        )
+
+        textures = []
+        for _ in range(bitmap_count):
+            textures.append(read_string(f, 256))
+
+        # Render-group/model metadata.  The two H values are polygon and
+        # vertex counts respectively in the supplied LR2 MDL0 files.
+        meta = struct.unpack("<8If3I2H4I", f.read(68))
+        polygons = meta[12]
+        vertices_count = meta[13]
+
+        # Texture-blend metadata (one header + four blend records).
+        f.read(8)
+        f.read(32)
+
+        # Vertex buffer descriptor.
+        (
+            vertex_offset_vector,
+            vertex_offset_normal,
+            vertex_offset_colour,
+            vertex_offset_texcoord,
+            vertex_size,
+            texcoord_count,
+            vertex_flags,
+            reported_vertices,
+            _managed_buffer,
+            _current_vertex,
+        ) = struct.unpack("<4I2I4H", f.read(32))
+        f.read(8)  # reserved
+
+        # In LR2 these patch models report the actual vertex count correctly;
+        # keep the header's polygon/vertex values as the authoritative counts.
+        vertices_count = int(vertices_count)
+        vertex_size = int(vertex_size)
+        if vertices_count <= 0 or vertex_size <= 0:
+            raise ValueError(f"Invalid MDL0 vertex descriptor: {vertices_count=} {vertex_size=}")
+
+        verts = []
+        norms = []
+        uvs = []
+        has_normals = bool(vertex_flags & 0b0010)
+        has_uv = bool(vertex_flags & 0b1000)
+        has_color = bool(vertex_flags & 0b0100)
+
+        vertex_data_start = f.tell()
+        for i in range(vertices_count):
+            raw = f.read(vertex_size)
+            if len(raw) != vertex_size:
+                raise ValueError(f"Truncated MDL0 vertex buffer at vertex {i}")
+
+            # Offsets in the descriptor are byte offsets within each vertex.
+            if vertex_offset_vector + 12 > vertex_size:
+                raise ValueError("MDL0 vector offset is outside vertex structure")
+            v = struct.unpack_from("<3f", raw, vertex_offset_vector)
+            verts.append(v)
+
+            if has_normals and vertex_offset_normal + 12 <= vertex_size:
+                norms.append(struct.unpack_from("<3f", raw, vertex_offset_normal))
+            else:
+                norms.append(None)
+
+            if has_uv and vertex_offset_texcoord + 8 <= vertex_size:
+                u = struct.unpack_from("<2f", raw, vertex_offset_texcoord)
+                uvs.append(u)
+            else:
+                uvs.append(None)
+
+        fill_type_raw = f.read(4)
+        if len(fill_type_raw) != 4:
+            raise ValueError("Missing MDL0 fill type")
+        fill_type = struct.unpack("<I", fill_type_raw)[0]
+
+        # The Arctic models are the documented LR2 exception: fill_type 1 is
+        # a triangle strip.  For N triangles, N+2 vertex references follow.
+        if fill_type == 0:
+            index_count = polygons * 3
+            indices = list(struct.unpack("<%dH" % index_count, f.read(index_count * 2))) if index_count else []
+        elif fill_type == 1:
+            index_count = polygons + 2
+            indices = list(struct.unpack("<%dH" % index_count, f.read(index_count * 2))) if index_count else []
+        else:
+            raise ValueError(f"Unsupported LR2 MDL0 fill type {fill_type}")
+
+        if any(i >= len(verts) for i in indices):
+            bad = max(i for i in indices if i >= len(verts))
+            raise ValueError(
+                f"MDL0 index {bad} exceeds vertex count {len(verts)}"
+            )
+
+        texture = textures[0] if textures else None
+        surfaces.append({
+            "vertices": verts,
+            "normals": norms,
+            "uvs": uvs,
+            "indices": indices,
+            "fill_type": fill_type,
+            "texture": texture,
+            "material": None,
+        })
+
+        log(
+            f"[LR2 Import] MDL0: {Path(path).name}: "
+            f"vertices={len(verts)}, polygons={polygons}, fill_type={fill_type}, "
+            f"indices={len(indices)}"
+        )
+
+    return surfaces
+
+# <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: parse_mdl0.
 def parse_mdl2(path):
+    # [Fluffy Cupcake, 18.09.2026] CHANGED: parse_mdl2 now detects the MDL0 magic and dispatches to parse_mdl0 (next 4 lines).
+    with open(path, "rb") as _mf:
+        magic = _mf.read(4)
+    if magic == b"MDL0":
+        return parse_mdl0(path)
+
     surfaces = []
     textures = []
     materials = []
@@ -688,6 +1084,136 @@ def resolve_path_ci(root, rel_path):
     return current
 
 
+# >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: IFL image-sequence resolution for Sea textures.
+# ==========================================================================
+# IFL (image sequence) resolution
+# ==========================================================================
+
+
+def resolve_first_ifl_texture(ifl_path, gamedata_root):
+    """Resolve an LR2 .ifl to its first image frame.
+
+    IFL files are simple image-sequence lists. For Blender we only need the
+    first frame, and the game's image files normally live beside the IFL.
+    Returns a resolved Path or None.
+    """
+    if ifl_path is None:
+        return None
+    path_text = str(ifl_path).strip()
+    if not path_text:
+        return None
+
+    if os.path.isabs(path_text):
+        ifl_file = Path(path_text)
+    else:
+        ifl_file = None
+        if gamedata_root:
+            # WRL strings commonly include the literal "game data\\" prefix,
+            # while gamedata_root already points to that directory.
+            normalized = path_text.replace("\\", "/").lstrip("/")
+            parts = [p for p in normalized.split("/") if p not in ("", ".")]
+            if parts and parts[0].lower() == Path(gamedata_root).name.lower():
+                normalized = "/".join(parts[1:])
+            elif parts and parts[0].lower() == "game data":
+                normalized = "/".join(parts[1:])
+
+            if normalized:
+                ifl_file = resolve_path_ci(gamedata_root, normalized)
+
+            # Also try the literal path in case the supplied root is actually
+            # the install root rather than GAME DATA.
+            if ifl_file is None:
+                ifl_file = resolve_path_ci(gamedata_root, path_text)
+
+    if ifl_file is None or not ifl_file.is_file():
+        return None
+
+    try:
+        raw = ifl_file.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    for line in raw.splitlines():
+        frame = line.strip().lstrip("\ufeff").strip().strip('"').strip()
+        if not frame or frame.startswith(";") or frame.startswith("#"):
+            continue
+
+        # LR2 IFL entries are "filename duration". The actual Sandy file,
+        # for example, contains "water01.tga 3". Keep only the filename.
+        parts = frame.split()
+        frame = parts[0].strip('"') if parts else ""
+        if not frame:
+            continue
+
+        # IFL names describe the logical image format (e.g. water01.tga),
+        # but LR2's actual on-disk texture is an MIP that our existing MIP
+        # decoder must parse. Therefore water01.tga -> water01.mip / water01.
+        frame_path = Path(frame)
+        frame_stem = frame_path.with_suffix("") if frame_path.suffix else frame_path
+        frame_candidates = [frame]
+        frame_candidates += [
+            str(frame_stem) + ext
+            for ext in (".mip", ".MIP", "")
+        ]
+
+        for candidate in frame_candidates:
+            resolved = resolve_path_ci(ifl_file.parent, candidate)
+            if resolved is not None and resolved.is_file():
+                print(
+                    f"[LR2 Import] Sea IFL: {ifl_file.name} -> "
+                    f"{resolved.name}"
+                )
+                return resolved
+
+        # Fall back to Game Data-relative paths.
+        if gamedata_root:
+            for candidate in frame_candidates:
+                resolved = resolve_path_ci(gamedata_root, candidate)
+                if resolved is not None and resolved.is_file():
+                    print(
+                        f"[LR2 Import] Sea IFL: {ifl_file.name} -> "
+                        f"{resolved.name}"
+                    )
+                    return resolved
+    return None
+
+
+def resolve_sea_texture(texture_path, gamedata_root):
+    """Resolve a cSea texture, using the first frame when it is an IFL."""
+    if not texture_path:
+        return None
+
+    path_text = str(texture_path).strip()
+    if path_text.lower().endswith(".ifl"):
+        first = resolve_first_ifl_texture(path_text, gamedata_root)
+        if first is not None:
+            return first
+        print(f"[LR2 Import] Sea IFL has no resolvable first frame: {path_text}")
+        return None
+
+    if os.path.isabs(path_text) and Path(path_text).is_file():
+        return Path(path_text)
+
+    if gamedata_root:
+        normalized = path_text.replace("\\", "/").lstrip("/")
+        parts = [p for p in normalized.split("/") if p not in ("", ".")]
+        if parts and (
+            parts[0].lower() == Path(gamedata_root).name.lower()
+            or parts[0].lower() == "game data"
+        ):
+            normalized = "/".join(parts[1:])
+
+        candidates = [normalized or path_text]
+        stem = candidates[0].rsplit(".", 1)[0] if "." in candidates[0] else candidates[0]
+        candidates += [stem + ".mip", stem + ".MIP"]
+        for cand in candidates:
+            resolved = resolve_path_ci(gamedata_root, cand)
+            if resolved is not None and resolved.is_file():
+                return resolved
+    return None
+
+
+# <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: IFL resolution.
 # ==========================================================================
 # Blender-side construction
 # ==========================================================================
@@ -895,6 +1421,464 @@ def build_terrain_material(cache, image_cache, tex_paths):
     return mat
 
 
+# >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: build_sea (cSea), WaterCourse Bezier/grid construction (build_watercourse) and build_water_sheet (cWaterSheet).
+SEA_DEFAULT_PLANE_SIZE = 10000.0
+
+
+def build_sea(name, size, height, convert_axes, material_cache, image_cache,
+              texture_path, rgb_s, gamedata_root, texture_tiles=20.0):
+    """Build cSea as a large horizontal plane.
+
+    cSea Hght is used as a raw source-world height baseline and converted to Blender Z.
+    If the texture path is an .ifl, only its first frame is used.
+    """
+    mesh = bpy.data.meshes.new(name)
+    bm = bmesh.new()
+
+    half = float(size) * 0.5
+    source_verts = [
+        (-half, 0.0, -half),
+        (-half, 0.0, half),
+        (half, 0.0, half),
+        (half, 0.0, -half),
+    ]
+    verts = [convert_position(v) if convert_axes else v for v in source_verts]
+    bm_verts = [bm.verts.new(v) for v in verts]
+
+    # Source +Y is the upward normal.
+    face = bm.faces.new((bm_verts[0], bm_verts[3], bm_verts[2], bm_verts[1]))
+    uv_layer = bm.loops.layers.uv.new()
+    # Increase Sea texture density by 50% while keeping physical Sea size
+    # independent from its UV tiling.
+    tiles = max(1.0, float(texture_tiles)) * 1.5
+    for loop, uv in zip(
+        face.loops,
+        ((0.0, 0.0), (tiles, 0.0), (tiles, tiles), (0.0, tiles)),
+    ):
+        loop[uv_layer].uv = uv
+
+    bm.to_mesh(mesh)
+    bm.free()
+
+    tint = tuple(rgb_s) if rgb_s and len(rgb_s) >= 4 else (255, 255, 255, 0)
+    r, g, b, strength = [max(0, min(255, int(v))) for v in tint]
+    tint_rgba = (r / 255.0, g / 255.0, b / 255.0, 1.0)
+
+    key = ("sea", texture_path, tuple(tint))
+    mat = material_cache.get(key)
+    if mat is None:
+        mat = bpy.data.materials.new(f"LR2_sea_mat_{len(material_cache)}")
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        bsdf = nodes.get("Principled BSDF")
+
+        if bsdf:
+            bsdf.inputs["Base Color"].default_value = tint_rgba
+
+        resolved = resolve_sea_texture(texture_path, gamedata_root)
+        print(
+            f"[LR2 Import] Sea texture: source={texture_path!r}, "
+            f"resolved={str(resolved) if resolved else None!r}"
+        )
+        if resolved is not None and bsdf:
+            img = load_image_cached(image_cache, resolved)
+            if img is None:
+                print(f"[LR2 Import] Sea texture decode failed: {resolved}")
+            if img is not None:
+                tex_node = nodes.new("ShaderNodeTexImage")
+                tex_node.image = img
+                tex_node.extension = "REPEAT"
+                tex_node.location = (-500, 0)
+
+                mix = nodes.new("ShaderNodeMixRGB")
+                mix.blend_type = "MULTIPLY"
+                # Fourth RGBS byte is intentionally uninterpreted.
+                mix.inputs[0].default_value = 1.0
+                mix.inputs[2].default_value = tint_rgba
+                mix.location = (-180, 0)
+                links.new(tex_node.outputs["Color"], mix.inputs[1])
+                links.new(mix.outputs["Color"], bsdf.inputs["Base Color"])
+
+        material_cache[key] = mat
+
+    mesh.materials.append(mat)
+    obj = bpy.data.objects.new(name, mesh)
+    # cSea Hght is applied as an absolute source-world height after creation.
+    obj.location = (0.0, 0.0, 0.0)
+    return obj
+
+
+
+
+# WaterCourse geometry reconstruction based on recovered game code.
+#
+# The game evaluates the control-point positions as a full Bezier curve using
+# Bernstein polynomials, then samples a procedural grid along that curve.  The
+# stored GridResolution is converted to a power-of-two grid size:
+#     grid = (1 << (GridResolution + 2)) + 1
+# The original engine also has a runtime LOD adjustment; the Blender importer
+# deliberately uses the WRL's stored resolution directly so imported geometry
+# is deterministic.
+#
+# The exact renderer's material animation is separate from the geometry.  For
+# Blender we retain a small flow-UV calibration knob so visual matching can be
+# tuned without changing the recovered mesh construction.
+# MatProps texture-tiling calibration recovered experimentally from the game.
+# DINO stores 100.0 at MatProps+0x40; a 0.1 multiplier gives the observed
+# longitudinal repetition. Crucially, the source field is per WaterCourse,
+# so worlds with different values (e.g. Mars) do not share one hard-coded tile
+# density.
+# Independent longitudinal calibration.  U is already empirically landing at
+# roughly 4-4.5 repeats across Dino/Mars; V needs more repeats to avoid the
+# obvious lengthwise squashing seen in the imported courses.
+# Final longitudinal calibration knob. 1.0 preserves the current V14 scale.
+WATERCOURSE_LENGTH_SCALE = 1.0
+
+
+def _binomial(n, k):
+    if k < 0 or k > n:
+        return 0
+    # Small n (max 31 control points) makes this cheap and stable.
+    return math.comb(n, k)
+
+
+def _bezier_eval(points, t):
+    """Evaluate XYZ + VOffset using the game's Bernstein/Bezier scheme."""
+    count = len(points)
+    if count == 1:
+        p = points[0]
+        return tuple(p["position"]), float(p.get("v_offset", 0.0) or 0.0)
+
+    n = count - 1
+    omt = 1.0 - t
+    x = y = z = vo = 0.0
+    for i, p in enumerate(points):
+        w = _binomial(n, i) * (omt ** (n - i)) * (t ** i)
+        px, py, pz = p["position"]
+        x += px * w
+        y += py * w
+        z += pz * w
+        vo += float(p.get("v_offset", 0.0) or 0.0) * w
+    return (x, y, z), vo
+
+
+def _bezier_tangent(points, t):
+    """Analytic derivative of the Bezier centerline."""
+    count = len(points)
+    if count < 2:
+        return (1.0, 0.0, 0.0)
+
+    n = count - 1
+    omt = 1.0 - t
+    tx = ty = tz = 0.0
+    for i in range(n):
+        w = _binomial(n - 1, i) * (omt ** (n - 1 - i)) * (t ** i)
+        p0 = points[i]["position"]
+        p1 = points[i + 1]["position"]
+        tx += (p1[0] - p0[0]) * w
+        ty += (p1[1] - p0[1]) * w
+        tz += (p1[2] - p0[2]) * w
+
+    tx *= n
+    ty *= n
+    tz *= n
+    length = math.sqrt(tx * tx + ty * ty + tz * tz)
+    if length <= 1e-10:
+        # Find a usable local direction if a degenerate tangent occurs.
+        for i in range(count - 1):
+            p0 = points[i]["position"]
+            p1 = points[i + 1]["position"]
+            dx, dy, dz = p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]
+            length = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if length > 1e-10:
+                return (dx / length, dy / length, dz / length)
+        return (1.0, 0.0, 0.0)
+    return (tx / length, ty / length, tz / length)
+
+
+def _watercourse_width(points, t):
+    """Interpolate Width along the control-point parameter linearly.
+
+    The recovered Bezier helper visibly evaluates Position + VOffset (four
+    values), while Width is a separate fifth value, so we keep width as a
+    piecewise-linear field rather than falsely treating it as a Bezier value.
+    """
+    if len(points) == 1:
+        return abs(float(points[0].get("width", 0.0) or 0.0))
+    s = max(0.0, min(1.0, t)) * (len(points) - 1)
+    i = min(int(math.floor(s)), len(points) - 2)
+    a = s - i
+    w0 = float(points[i].get("width", 0.0) or 0.0)
+    w1 = float(points[i + 1].get("width", 0.0) or 0.0)
+    return abs(w0 + (w1 - w0) * a)
+
+
+def _watercourse_side_from_tangent(tangent):
+    """Return the horizontal cross-course direction in LR2 source space."""
+    tx, ty, tz = tangent
+    # LR2 world data is Y-up.  Project tangent into X/Z and take a 90-degree
+    # horizontal perpendicular. This keeps the generated course surface flat
+    # across its width while still following the 3D Bezier centerline height.
+    length = math.sqrt(tx * tx + tz * tz)
+    if length > 1e-10:
+        sx, sz = tz / length, -tx / length
+        return (sx, 0.0, sz)
+    # Nearly vertical tangent: choose a stable fallback.
+    return (1.0, 0.0, 0.0)
+
+
+def _watercourse_grid_resolution(stored_resolution):
+    try:
+        r = int(stored_resolution)
+    except (TypeError, ValueError):
+        r = 1
+    r = max(0, min(r, 5))
+    return (1 << (r + 2)) + 1
+
+
+def build_watercourse(name, points, course_ref, grid_resolution,
+                      bottom_layer_speed, top_layer_speed, wavyness,
+                      texture_disturbance, flow_direction,
+                      texture_tiling, texture_tiling_aux,
+                      flow_uv_factor, longitudinal_uv_factor,
+                      convert_axes, material_cache, image_cache, water_texture,
+                      bed_texture, gamedata_root):
+    """Generate a procedural cWaterCourse mesh from the recovered data model."""
+    if len(points) < 2:
+        raise ValueError("WaterCourse needs at least two control points")
+
+    ref = tuple(course_ref or (0.0, 0.0, 0.0))
+    grid = _watercourse_grid_resolution(grid_resolution)
+
+    # Sample the exact Bezier centerline at the same number of longitudinal
+    # rows as the generated grid dimension.
+    samples = []
+    for i in range(grid):
+        t = i / float(grid - 1)
+        center, v_offset = _bezier_eval(points, t)
+        tangent = _bezier_tangent(points, t)
+        width = _watercourse_width(points, t)
+        side = _watercourse_side_from_tangent(tangent)
+        samples.append((
+            (center[0] + ref[0], center[1] + ref[1], center[2] + ref[2]),
+            width,
+            v_offset,
+            side,
+        ))
+
+    # Longitudinal UVs repeat once per control-point segment.
+    try:
+        texture_tiles = float(texture_tiling)
+    except (TypeError, ValueError):
+        texture_tiles = 1.0
+    if not math.isfinite(texture_tiles) or texture_tiles <= 0.0:
+        texture_tiles = 1.0
+    effective_flow_tiles = 1.0
+
+    mesh = bpy.data.meshes.new(name)
+    verts = []
+    faces = []
+    uvs = []
+
+    # Grid columns run across the width. Rows run along the Bezier course.
+    for row, (center, width, v_offset, side) in enumerate(samples):
+        sx, sy, sz = side
+        half = width * 0.5
+        segment_count = max(1, len(points) - 1)
+        v_base = (row / float(grid - 1)) * segment_count * WATERCOURSE_LENGTH_SCALE + v_offset
+
+        for col in range(grid):
+            across = -1.0 + 2.0 * (col / float(grid - 1))
+            px = center[0] + sx * half * across
+            py = center[1]
+            pz = center[2] + sz * half * across
+            src = (px, py, pz)
+            verts.append(convert_position(src) if convert_axes else src)
+
+            # U is across the course.  Keep its texture density in WORLD
+            # SPACE instead of normalizing it by the total course length.  V's
+            # texture_tiling value describes longitudinal repetition; using
+            # total_distance here made U depend on how long the whole river
+            # happened to be, which caused wide Mars courses to be under-tiled
+            # and also changed Dino's width appearance.
+            #
+            # The recovered 0.1 UV calibration gives a useful world-space
+            # repeat density across the width: a 10-unit-wide course gets about
+            # one texture repeat, a 20-unit-wide course gets about two, etc.
+            u = col / float(grid - 1)
+            uvs.append((u, v_base))
+
+    # Triangle indices for the NxN grid.  Using ordinary triangles here is
+    # Blender-friendly; the original engine uses a strip-oriented index buffer
+    # internally, but the vertex topology is the same grid.
+    for row in range(grid - 1):
+        base0 = row * grid
+        base1 = (row + 1) * grid
+        for col in range(grid - 1):
+            a = base0 + col
+            b = base0 + col + 1
+            c = base1 + col + 1
+            d = base1 + col
+            faces.append((a, b, c, d))
+
+    mesh.from_pydata(verts, [], faces)
+    mesh.update()
+
+    uv_layer = mesh.uv_layers.new(name="UVMap")
+    for poly in mesh.polygons:
+        for loop_index in poly.loop_indices:
+            vi = mesh.loops[loop_index].vertex_index
+            uv_layer.data[loop_index].uv = uvs[vi]
+
+    # WaterCourse is a two-layer material: BottomTexture + TopTexture.
+    # The top texture's alpha is used as the layer mask when available.  This
+    # preserves the old V6 appearance for opaque top textures while allowing
+    # Mars-style courses to expose the underlying bottom/lava texture.
+    key = ("watercourse", water_texture, bed_texture,
+           round(float(bottom_layer_speed), 6), round(float(top_layer_speed), 6),
+           round(float(wavyness), 6), round(float(texture_disturbance), 6),
+           int(flow_direction), round(float(texture_tiles), 6))
+    mat = material_cache.get(key)
+    if mat is None:
+        mat = bpy.data.materials.new(f"LR2_watercourse_mat_{len(material_cache)}")
+        mat.use_nodes = True
+        nodes = mat.node_tree.nodes
+        links = mat.node_tree.links
+        bsdf = nodes.get("Principled BSDF")
+
+        def resolve_texture(tex_path):
+            if not tex_path or not gamedata_root:
+                return None
+            candidates = [tex_path]
+            stem = tex_path.rsplit(".", 1)[0] if "." in tex_path else tex_path
+            candidates += [stem + ".mip", stem + ".MIP"]
+            for cand in candidates:
+                rp = resolve_path_ci(gamedata_root, cand)
+                if rp is not None and rp.is_file():
+                    return rp
+            return None
+
+        bottom_resolved = resolve_texture(bed_texture)
+        top_resolved = resolve_texture(water_texture)
+
+        if bsdf is not None:
+            # Separate UV mapping nodes make the two runtime layers independent.
+            # The actual game scrolls these using BottomLayerSpeed/TopLayerSpeed;
+            # for the Blender preview we keep frame-0 coordinates stable and
+            # expose the speeds as custom properties below.
+            uv = nodes.new("ShaderNodeUVMap")
+            uv.location = (-900, 0)
+            uv.uv_map = "UVMap"
+
+            bottom_tex = None
+            if bottom_resolved is not None:
+                bottom_tex = nodes.new("ShaderNodeTexImage")
+                bottom_tex.image = load_image_cached(image_cache, bottom_resolved)
+                bottom_tex.extension = "REPEAT"
+                bottom_tex.location = (-620, -120)
+
+            top_tex = None
+            if top_resolved is not None:
+                top_tex = nodes.new("ShaderNodeTexImage")
+                top_tex.image = load_image_cached(image_cache, top_resolved)
+                top_tex.extension = "REPEAT"
+                top_tex.location = (-620, 140)
+
+            if bottom_tex is not None and top_tex is not None:
+                links.new(uv.outputs["UV"], bottom_tex.inputs["Vector"])
+                links.new(uv.outputs["UV"], top_tex.inputs["Vector"])
+
+                # Prefer the top layer wherever it supplies alpha.  For fully
+                # opaque top textures this intentionally reduces to the V6
+                # result, so DINO remains unchanged while transparent/partial
+                # top layers reveal their bottom layer (important for Mars).
+                mix = nodes.new("ShaderNodeMixRGB")
+                mix.blend_type = "MIX"
+                mix.inputs[0].default_value = 1.0
+                mix.location = (-80, 60)
+                links.new(top_tex.outputs["Alpha"], mix.inputs[0])
+                links.new(bottom_tex.outputs["Color"], mix.inputs[1])
+                links.new(top_tex.outputs["Color"], mix.inputs[2])
+                links.new(mix.outputs["Color"], bsdf.inputs["Base Color"])
+            elif top_tex is not None:
+                links.new(uv.outputs["UV"], top_tex.inputs["Vector"])
+                links.new(top_tex.outputs["Color"], bsdf.inputs["Base Color"])
+            elif bottom_tex is not None:
+                links.new(uv.outputs["UV"], bottom_tex.inputs["Vector"])
+                links.new(bottom_tex.outputs["Color"], bsdf.inputs["Base Color"])
+
+            if "Roughness" in bsdf.inputs:
+                bsdf.inputs["Roughness"].default_value = 0.25
+
+        material_cache[key] = mat
+
+    mesh.materials.append(mat)
+    obj = bpy.data.objects.new(name, mesh)
+    obj["lr2_object_type"] = "cWaterCourse"
+    obj["lr2_watercourse_grid_resolution"] = int(grid_resolution)
+    obj["lr2_watercourse_grid_size"] = grid
+    obj["lr2_watercourse_bottom_layer_speed"] = float(bottom_layer_speed)
+    obj["lr2_watercourse_top_layer_speed"] = float(top_layer_speed)
+    obj["lr2_watercourse_wavyness"] = float(wavyness)
+    obj["lr2_watercourse_texture_disturbance"] = float(texture_disturbance)
+    obj["lr2_watercourse_flow_direction"] = int(flow_direction)
+    obj["lr2_watercourse_uv_flow_factor"] = 1.0
+    obj["lr2_watercourse_uv_width_factor"] = float(flow_uv_factor)
+    obj["lr2_watercourse_uv_longitudinal_factor"] = float(longitudinal_uv_factor)
+    obj["lr2_watercourse_texture_tiling"] = texture_tiles
+    obj["lr2_watercourse_texture_tiling_aux"] = float(texture_tiling_aux) if texture_tiling_aux is not None else 0.0
+    obj["lr2_watercourse_effective_flow_tiles"] = effective_flow_tiles
+    obj["lr2_watercourse_uv_width_mode"] = "physical_width_scaled"
+    obj["lr2_watercourse_water_texture"] = water_texture
+    obj["lr2_watercourse_bed_texture"] = bed_texture
+    obj["lr2_watercourse_point_count"] = len(points)
+    obj["lr2_watercourse_course_ref"] = ref
+    return obj
+
+def build_water_sheet(name, width, height, convert_axes, material_cache, image_cache,
+                      water_texture, reflection_texture, gamedata_root):
+    """Build a horizontal WaterSheet plane in the source LR2 coordinate system.
+
+    WaterSheet records contain their geometry dimensions directly in the WRL;
+    unlike MD2 objects, there is no external model to load.
+    """
+    mesh = bpy.data.meshes.new(name)
+    bm = bmesh.new()
+
+    # Source plane lies in LR2 X/Z with +Y as its upward normal.
+    hx = width * 0.5
+    hz = height * 0.5
+    source_verts = [
+        (-hx, 0.0, -hz),
+        (-hx, 0.0,  hz),
+        ( hx, 0.0,  hz),
+        ( hx, 0.0, -hz),
+    ]
+    verts = [convert_position(v) if convert_axes else v for v in source_verts]
+    bm_verts = [bm.verts.new(v) for v in verts]
+
+    # +Y source normal: choose winding accordingly.
+    face = bm.faces.new((bm_verts[0], bm_verts[3], bm_verts[2], bm_verts[1]))
+
+    uv_layer = bm.loops.layers.uv.new()
+    for loop, uv in zip(face.loops, ((0.0, 0.0), (1.0, 0.0), (1.0, 1.0), (0.0, 1.0))):
+        loop[uv_layer].uv = uv
+
+    bm.to_mesh(mesh)
+    bm.free()
+
+    # Use the same material/texture resolution path as ordinary models.
+    mat = get_or_build_material(
+        material_cache, image_cache, water_texture, None, gamedata_root
+    )
+    mesh.materials.append(mat)
+
+    obj = bpy.data.objects.new(name, mesh)
+    return obj
+
+
+# <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: build_sea / build_watercourse / build_water_sheet.
 def build_object(name, surfaces, convert_axes, material_cache, image_cache, gamedata_root,
                   is_terrain=False, uv_scale=(1.0, 1.0)):
     mesh = bpy.data.meshes.new(name)
@@ -941,10 +1925,12 @@ def build_object(name, surfaces, convert_axes, material_cache, image_cache, game
         # correct outward-facing shading for this source data).
         for a, b, c in tris:
             try:
-                face = bm.faces.new((bm_verts[a], bm_verts[c], bm_verts[b]))
+                # [Fluffy Cupcake, 18.09.2026] CHANGED: triangle winding changed (was (a, c, b)); the comment above may be outdated.
+                face = bm.faces.new((bm_verts[a], bm_verts[b], bm_verts[c]))
             except ValueError:
                 continue  # duplicate face, skip
-            ordered = (a, c, b)
+            # [Fluffy Cupcake, 18.09.2026] CHANGED: matches the changed winding above (was (a, c, b)).
+            ordered = (a, b, c)
             for idx, loop in zip(ordered, face.loops):
                 if idx < len(uvs_src) and uvs_src[idx]:
                     u, v = uvs_src[idx]
@@ -984,6 +1970,30 @@ def build_object(name, surfaces, convert_axes, material_cache, image_cache, game
 # ==========================================================================
 
 
+# >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: auto-detection of the Game Data root from the selected WRL path.
+def infer_gamedata_root_from_wrl(wrl_path):
+    """Infer the game root from .../<anything>/GAME DATA/SAVED WORLDS/<world>.WRL."""
+    if not wrl_path:
+        return ""
+
+    path = Path(wrl_path)
+    parts = list(path.parts)
+
+    game_data_index = next(
+        (i for i, part in enumerate(parts) if part.casefold() == "game data"),
+        None,
+    )
+    if game_data_index is None or game_data_index == 0:
+        return ""
+
+    root = Path(*parts[:game_data_index])
+    try:
+        return str(root.resolve())
+    except OSError:
+        return str(root)
+
+
+# <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: infer_gamedata_root_from_wrl.
 class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
     bl_idname = "import_scene.lr2_world"
     bl_label = "Import LR2 World (.wrl)"
@@ -1004,6 +2014,29 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
         description="Convert LR2's Y-up coordinate system to Blender's Z-up",
         default=True,
     )
+    # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: new import options: Sea Texture Tiles, WaterCourse Width/Longitudinal UV Factor.
+    sea_texture_tiles: FloatProperty(
+        name="Sea Texture Tiles",
+        description="Number of times the Sea texture repeats across the generated Sea plane",
+        default=20.0,
+        min=1.0,
+        max=200.0,
+    )
+    watercourse_flow_uv_factor: FloatProperty(
+        name="WaterCourse Width UV Factor",
+        description="World-space texture repeat density across WaterCourse width. 0.02 currently matches DINO and Mars.",
+        default=0.02,
+        min=0.0001,
+        max=10.0,
+    )
+    watercourse_longitudinal_uv_factor: FloatProperty(
+        name="WaterCourse Longitudinal UV Factor",
+        description="Independent texture repeat density along WaterCourse length. DINO currently matches 0.08; Mars needs a much larger value.",
+        default=0.08,
+        min=0.0001,
+        max=10.0,
+    )
+    # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: new import options.
     import_terrain: BoolProperty(
         name="Import Terrain",
         description="Also import the level's terrain heightmap",
@@ -1014,9 +2047,10 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
         description="Don't import cThePits entities",
         default=True,
     )
-    skip_plasball: BoolProperty(
-        name="Skip Plasball Pickups",
-        description="Don't import 'plasball' weapon pickup objects",
+    # [Fluffy Cupcake, 18.09.2026] CHANGED: replaces the former option "skip_plasball" ("Skip Plasball Pickups"); works via layer detection.
+    skip_races: BoolProperty(
+        name="Skip Races",
+        description="Skip all objects on layers identified by race-specific WRL entities",
         default=False,
     )
     group_zone_pairs: BoolProperty(
@@ -1031,15 +2065,42 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
 
     def execute(self, context):
         wrl_path = self.filepath
+        # [Fluffy Cupcake, 18.09.2026] CHANGED: import log file next to the WRL (<name>_lr2_import.log) (next 3 lines + later log() calls).
+        set_import_log(str(Path(wrl_path).with_name(Path(wrl_path).stem + "_lr2_import.log")))
+        log(f"[LR2 Import] ===== START {wrl_path} =====")
         gamedata_root = self.gamedata_dir
+        log(f"[LR2 Import] Initial GAMEDATA root={gamedata_root!r}")
+
+        # [Fluffy Cupcake, 18.09.2026] CHANGED: Game Data path is auto-detected when the field is empty (next lines).
+        # Automatically derive the game root from the selected WRL when the
+        # field is blank. The outer "LEGO Racers 2" folder can have any name.
+        if not gamedata_root:
+            gamedata_root = infer_gamedata_root_from_wrl(wrl_path)
+            if gamedata_root:
+                self.gamedata_dir = gamedata_root
+                log(f"[LR2 Import] Inferred GAMEDATA root={gamedata_root!r}")
 
         if not gamedata_root:
-            self.report({"ERROR"}, "Please set the GAMEDATA folder in the import options panel.")
+            # [Fluffy Cupcake, 18.09.2026] CHANGED: error message changed (previously: 'Please set the GAMEDATA folder in the import options panel.').
+            self.report(
+                {"ERROR"},
+                "Could not infer the game root from this WRL. "
+                "Expected .../GAME DATA/SAVED WORLDS/<world>.WRL; "
+                "set GAMEDATA Folder manually.",
+            )
             return {"CANCELLED"}
 
         try:
             entities = parse_wrl(wrl_path)
+            # [Fluffy Cupcake, 18.09.2026] CHANGED: additional diagnostics for cPatch / cWaterCourse entities (next 5 lines).
+            log(f"[LR2 Import] Parsed WRL entities={len(entities)}")
+            patch_entities = [e for e in entities if e.type_id == "cPatch"]
+            log(f"[LR2 Import] cPatch entities={len(patch_entities)}")
+            watercourse_entities = [e for e in entities if e.type_id == "cWaterCourse"]
+            log(f"[LR2 Import] cWaterCourse entities={len(watercourse_entities)}")
         except Exception as e:  # noqa: BLE001
+            # [Fluffy Cupcake, 18.09.2026] CHANGED: error is now also written to the import log.
+            log(f"[LR2 Import] WRL PARSE ERROR: {e}\n{traceback.format_exc()}")
             self.report({"ERROR"}, f"Failed to parse WRL: {e}")
             return {"CANCELLED"}
 
@@ -1060,9 +2121,68 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
         name_to_obj = {}  # entity name -> placed instance (for binding/parenting resolution)
         placed = 0
         skipped = 0
+        # [Fluffy Cupcake, 18.09.2026] CHANGED: collections for Sea / SkyBox / terrain objects (used for Sea sizing and height).
+        sea_objects = []
+        skybox_objects = []
+        terrain_objects = []
 
         ZONE_FLAG = 0x200000
 
+        # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: race layer detection for the "Skip Races" option.
+        # Race filtering is layer-based. Generic static/mobile objects are
+        # not classified by their names. Once a layer is identified as a race
+        # layer, every object on that layer is skipped.
+        RACE_ENTITY_TYPES = {
+            "cRaceStartPos",
+            "cCheckPoint",
+            "cCheckPointSupervisor",
+            "cAISupervisor",
+            "cAIQuad",
+            "cAISection",
+        }
+
+        # Verified layer families from the real WRLs.  The 0x2000 variants are
+        # important for GeneralMobile checkpoint assets (for example, 0x62
+        # has a corresponding 0x2062 representation).  0x200000 is the
+        # existing paired-layer flag.
+        VERIFIED_RACE_BASE_LAYERS = {
+            "sandy": {0x20, 0x22, 0x40, 0x42, 0x60, 0x62, 0x80, 0x82},
+            "dino":  {0x20, 0x22, 0x40, 0x42, 0x60, 0x62, 0x80, 0x82, 0xA0, 0xA2},
+            "mars":  {0x20, 0x22, 0x40, 0x42, 0x60, 0x62, 0x80, 0x82, 0xA0, 0xA2},
+            "arctic": {0x20, 0x22, 0x40, 0x42, 0x60, 0x62, 0x80, 0x82, 0xA0, 0xA2},
+            "carcraze": {
+                0x20, 0x22, 0x40, 0x42, 0x60, 0x62, 0x80, 0x82,
+                0xA0, 0xA2, 0xC0, 0xC2, 0xE0, 0xE2, 0x120, 0x122,
+            },
+        }
+
+        world_key = Path(wrl_path).stem.lower()
+        base_layers = set(VERIFIED_RACE_BASE_LAYERS.get(world_key, set()))
+
+        if base_layers:
+            # Build the exact observed representations of each base race
+            # layer. Do not generate arbitrary +/- layer IDs.
+            race_layers = set(base_layers)
+            race_layers.update(layer ^ 0x2000 for layer in base_layers)
+            race_layers.update(layer ^ ZONE_FLAG for layer in base_layers)
+            race_layers.update((layer ^ 0x2000) ^ ZONE_FLAG for layer in base_layers)
+        else:
+            # Unknown world: discover only the actual race-control layers
+            # present in the WRL and their existing paired-zone layers.
+            race_layers = {
+                entity.layer
+                for entity in entities
+                if entity.type_id in RACE_ENTITY_TYPES
+            }
+            race_layers |= {layer ^ ZONE_FLAG for layer in race_layers}
+
+        if self.skip_races:
+            print(
+                "[LR2 Import] Skip Races layers: "
+                + ", ".join(f"{layer} ({layer:#x})" for layer in sorted(race_layers))
+            )
+
+        # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: race layer detection.
         def get_layer_collection(layer_value):
             coll = layer_collections.get(layer_value)
             if coll is not None:
@@ -1083,24 +2203,176 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
             layer_collections[layer_value] = coll
             return coll
 
+
         for e in entities:
-            spec = WRL_FORMATS.get((e.type_id, e.u))
-            if spec is None or spec["model"] is None:
-                continue
-            model_ref = e.props.get(spec["model"])
-            if not model_ref:
+            # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: Skip Races check (replaces the former skip_plasball check further below; plasball objects are still skipped).
+            if self.skip_races and (
+                e.layer in race_layers
+                or "plasball" in str(e.name or "").lower()
+                or "plasball" in str(e.props.get("model", "") or "").lower()
+            ):
+                skipped += 1
                 continue
 
+            # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: Skip Races check.
+            # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: cSea import.
+            # cSea is the global ocean surrounding the islands. It has no
+            # finite geometry dimensions in the WRL, so generate a large plane.
+            if e.type_id == "cSea":
+                sea_name = e.name or "Sea"
+                sea_height = float(e.props.get("sea_height", 0.0) or 0.0)
+                sea_texture = e.props.get("sea_texture", "")
+                rgb_s = e.props.get("sea_rgb_s", b"\\xff\\xff\\xff\\x00")
+
+                inst = build_sea(
+                    sea_name,
+                    SEA_DEFAULT_PLANE_SIZE,
+                    sea_height,
+                    self.convert_axes,
+                    material_cache,
+                    image_cache,
+                    sea_texture,
+                    rgb_s,
+                    gamedata_root,
+                    self.sea_texture_tiles,
+                )
+                get_layer_collection(e.layer).objects.link(inst)
+                inst["lr2_sea_height"] = sea_height
+                inst["lr2_sea_rise_lower"] = float(e.props.get("sea_rise_lower", 0.0) or 0.0)
+                inst["lr2_sea_fade_distance"] = float(e.props.get("sea_fade_distance", 0.0) or 0.0)
+                inst["lr2_sea_rgba"] = tuple(rgb_s) if rgb_s else (255, 255, 255, 0)
+                inst["lr2_sea_texture"] = sea_texture
+                inst["lr2_sea_texture_tiles"] = float(self.sea_texture_tiles)
+                inst["lr2_sea_binding"] = (e.props.get("binding") or "").strip()
+                sea_objects.append(inst)
+
+                print(
+                    f"[LR2 Import] Sea: height={sea_height:.4f}, "
+                    f"rise_lower={float(e.props.get('sea_rise_lower', 0.0) or 0.0):.4f}, "
+                    f"fade={float(e.props.get('sea_fade_distance', 0.0) or 0.0):.4f}, "
+                    f"texture={sea_texture!r}, RGBS={tuple(rgb_s) if rgb_s else None}"
+                )
+
+                placed += 1
+                name_to_obj[(e.name or "").strip()] = (
+                    inst, (e.props.get("binding") or "").strip()
+                )
+                continue
+
+            # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: cSea import.
+            # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: cWaterSheet (water plane) import.
+            # WaterSheets are procedural geometry embedded in the WRL.
+            # They do not have a model reference, so handle them separately
+            # from the normal MD2/terrain model path.
+            if e.type_id == "cWaterSheet":
+                water_texture = e.props.get("water_texture", "")
+                reflection_texture = e.props.get("reflection_texture", "")
+                width = float(e.props.get("width", 0.0) or 0.0)
+                height = float(e.props.get("height", 0.0) or 0.0)
+
+                if width <= 0.0 or height <= 0.0:
+                    print(f"[LR2 Import] Invalid WaterSheet size for {e.name!r}: {width} x {height}")
+                    skipped += 1
+                    continue
+
+                water_name = e.name or "WaterSheet"
+                inst = build_water_sheet(
+                    water_name, width, height, self.convert_axes,
+                    material_cache, image_cache, water_texture,
+                    reflection_texture, gamedata_root
+                )
+                get_layer_collection(e.layer).objects.link(inst)
+
+                pos = e.props.get("position", (0.0, 0.0, 0.0))
+                rot = e.props.get("rotation", (0.0, 0.0, 0.0, 1.0))
+                if self.convert_axes:
+                    pos = convert_position(pos)
+                    rot = convert_rotation(rot)
+
+                inst.location = pos
+                inst.rotation_mode = "QUATERNION"
+                x, y, z, w = rot
+                inst.rotation_quaternion = (w, x, y, z)
+
+                placed += 1
+                name_to_obj[(e.name or "").strip()] = (inst, "")
+                continue
+
+            # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: cWaterSheet import.
+            # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: cWaterCourse import.
+            if e.type_id == "cWaterCourse":
+                points = e.props.get("points", [])
+                if len(points) < 2:
+                    log(f"[LR2 Import] SKIP cWaterCourse name={e.name!r}: only {len(points)} points")
+                    skipped += 1
+                    continue
+
+                try:
+                    inst = build_watercourse(
+                        e.name or "WaterCourse",
+                        points,
+                        e.props.get("course_ref", (0.0, 0.0, 0.0)),
+                        e.props.get("grid_resolution", 1),
+                        e.props.get("bottom_layer_speed", 0.0),
+                        e.props.get("top_layer_speed", 0.0),
+                        e.props.get("wavyness", 0.0),
+                        e.props.get("texture_disturbance", 0.0),
+                        e.props.get("flow_direction", 0),
+                        e.props.get("texture_tiling", 1.0),
+                        e.props.get("texture_tiling_aux", 0.0),
+                        self.watercourse_flow_uv_factor,
+                        self.watercourse_longitudinal_uv_factor,
+                        self.convert_axes,
+                        material_cache,
+                        image_cache,
+                        e.props.get("water_texture", ""),
+                        e.props.get("bed_texture", ""),
+                        gamedata_root,
+                    )
+                    get_layer_collection(e.layer).objects.link(inst)
+                    inst["lr2_watercourse_course_ref"] = tuple(e.props.get("course_ref", (0.0, 0.0, 0.0)))
+                    inst["lr2_watercourse_binding"] = (e.props.get("binding") or "").strip()
+                    log(f"[LR2 Import] PLACED cWaterCourse name={inst.name!r} layer={e.layer} "
+                        f"points={len(points)} grid={inst.get('lr2_watercourse_grid_size')} "
+                        f"grid_res={int(e.props.get('grid_resolution', 1) or 1)} "
+                        f"flow_dir={int(e.props.get('flow_direction', 0) or 0)} "
+                        f"tex_tiling={float(e.props.get('texture_tiling', 1.0) or 1.0):.6g} "
+                        f"uv_width={self.watercourse_flow_uv_factor:.6g} "
+                        f"uv_long={self.watercourse_longitudinal_uv_factor:.6g}")
+                    placed += 1
+                    name_to_obj[(e.name or "").strip()] = (inst, (e.props.get("binding") or "").strip())
+                except Exception as ex:  # noqa: BLE001
+                    log(f"[LR2 Import] FAILED cWaterCourse name={e.name!r}: {ex}\n{traceback.format_exc()}")
+                    skipped += 1
+                continue
+
+            # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: cWaterCourse import.
+            # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: cPatch (land patch) model reference handling, skipped-counter logic, is_patch flag; the old skip_plasball check was removed here.
+            spec = WRL_FORMATS.get((e.type_id, e.u))
+            if e.type_id == "cPatch":
+                model_ref = e.props.get("model")
+            else:
+                if spec is None or spec["model"] is None:
+                    continue
+                model_ref = e.props.get(spec["model"])
+            if not model_ref:
+                if e.type_id == "cPatch":
+                    log(f"[LR2 Import] SKIP cPatch name={e.name!r}: no model reference")
+                skipped += 1
+                continue
+
+            if e.type_id == "cPatch":
+                log(f"[LR2 Import] PATCH entity: name={e.name!r}, layer={e.layer}, "
+                    f"u={e.u}, model_ref={model_ref!r}")
+
             is_terrain = e.type_id == "cLegoTerrain"
+            is_patch = e.type_id == "cPatch"
             if is_terrain and not self.import_terrain:
                 continue
             if self.skip_the_pits and e.type_id == "cThePits":
                 skipped += 1
                 continue
-            if self.skip_plasball and "plasball" in (e.name or "").lower():
-                skipped += 1
-                continue
-
+            # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: cPatch handling.
             if model_ref not in model_cache:
                 surfaces = None
                 obj_name = None
@@ -1115,22 +2387,39 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
                                 obj_name = f"terrain_{Path(model_ref).name}"
                                 uv_scale = e.props.get("texture_scale", (1.0, 1.0)) or (1.0, 1.0)
                             except Exception as ex:  # noqa: BLE001
-                                print(f"[LR2 Import] Failed to parse terrain {terr_file}: {ex}")
+                                # [Fluffy Cupcake, 18.09.2026] CHANGED: print() -> log() (also written to the import log).
+                                log(f"[LR2 Import] Failed to parse terrain {terr_file}: {ex}")
                     if surfaces is None:
-                        print(f"[LR2 Import] Terrain not found/parsable: {model_ref}")
+                        # [Fluffy Cupcake, 18.09.2026] CHANGED: print() -> log().
+                        log(f"[LR2 Import] Terrain not found/parsable: {model_ref}")
                 else:
                     path = model_ref if model_ref.lower().endswith(".md2") else model_ref + ".md2"
                     resolved = resolve_path_ci(gamedata_root, path)
+                    # [Fluffy Cupcake, 18.09.2026] CHANGED: additional cPatch diagnostics.
+                    if is_patch:
+                        log(f"[LR2 Import] Resolve cPatch model: root={gamedata_root!r} ref={model_ref!r} "
+                            f"candidate={path!r} -> {str(resolved) if resolved else None!r}")
                     if resolved is not None:
                         try:
                             surfaces = parse_mdl2(str(resolved))
+                            # [Fluffy Cupcake, 18.09.2026] CHANGED: additional cPatch diagnostics.
+                            if is_patch:
+                                log(f"[LR2 Import] Parsed cPatch model {resolved.name}: surfaces={len(surfaces)} "
+                                    f"verts={sum(len(s.get('vertices', [])) for s in surfaces)}")
                             obj_name = Path(model_ref).stem
                         except Exception as ex:  # noqa: BLE001
-                            print(f"[LR2 Import] Failed to parse model {resolved}: {ex}")
+                            # [Fluffy Cupcake, 18.09.2026] CHANGED: model parse errors and 'model not found' are now only logged for cPatch models (previously logged via print() for all models) - see also the next note.
+                            if is_patch:
+                                log(f"[LR2 Import] Failed to parse cPatch model {resolved}: {ex}\n{traceback.format_exc()}")
                     else:
-                        print(f"[LR2 Import] Model not found: {model_ref}")
+                        # [Fluffy Cupcake, 18.09.2026] CHANGED: see note above: 'Model not found' message is now only logged for cPatch.
+                        if is_patch:
+                            log(f"[LR2 Import] cPatch model not found: {model_ref} | root={gamedata_root!r} | candidate={path!r}")
 
                 if surfaces is not None:
+                    # [Fluffy Cupcake, 18.09.2026] CHANGED: additional cPatch diagnostics.
+                    if is_patch:
+                        log(f"[LR2 Import] Building cPatch template for {obj_name!r} from {model_ref!r}")
                     template = build_object(
                         obj_name, surfaces, self.convert_axes, material_cache, image_cache, gamedata_root,
                         is_terrain=is_terrain, uv_scale=uv_scale,
@@ -1141,6 +2430,9 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
 
             template = model_cache[model_ref]
             if template is None:
+                # [Fluffy Cupcake, 18.09.2026] CHANGED: additional cPatch diagnostics.
+                if is_patch:
+                    log(f"[LR2 Import] TEMPLATE FAILED for cPatch name={e.name!r} model={model_ref!r}")
                 skipped += 1
                 continue
 
@@ -1148,6 +2440,12 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
             inst.data = template.data
             inst.name = e.name or e.type_id
             get_layer_collection(e.layer).objects.link(inst)
+            # Keep the import log useful during reverse engineering without
+            # dumping thousands of ordinary GeneralStatic placements.
+            # [Fluffy Cupcake, 18.09.2026] CHANGED: additional cPatch diagnostics.
+            if is_patch:
+                log(f"[LR2 Import] PLACED cPatch name={inst.name!r} model={model_ref!r} "
+                    f"layer={e.layer}")
 
             pos = e.props.get("position", (0.0, 0.0, 0.0))
             rot = e.props.get("rotation", (0.0, 0.0, 0.0, 1.0))
@@ -1162,11 +2460,92 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
             x, y, z, w = rot
             inst.rotation_quaternion = (w, x, y, z)
             inst.scale = scale
+            # [Fluffy Cupcake, 18.09.2026] CHANGED: cPatch diagnostics and custom properties (lr2_object_type, lr2_patch_model, lr2_patch_binding).
+            if is_patch:
+                log(f"[LR2 Import] PATCH transform name={inst.name!r} location={tuple(inst.location)} "
+                    f"rotation_quat={tuple(inst.rotation_quaternion)} scale={tuple(inst.scale)}")
+                inst["lr2_object_type"] = "cPatch"
+                inst["lr2_patch_model"] = model_ref
+                inst["lr2_patch_binding"] = (e.props.get("binding") or "").strip()
             placed += 1
+
+            # [Fluffy Cupcake, 18.09.2026] CHANGED: SkyBox / terrain objects are collected (needed for Sea sizing and Sea height).
+            if e.type_id == "cSkyBox":
+                skybox_objects.append(inst)
+            elif e.type_id in {"cLegoTerrain", "cTerrain2"}:
+                terrain_objects.append(inst)
 
             binding = (e.props.get("binding") or "").strip()
             name_to_obj[(e.name or "").strip()] = (inst, binding)
 
+        # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: Sea plane sizing (SkyBox-derived) and Sea height conversion.
+        # cSea follows the player's view in-game, so it has no finite WRL
+        # dimensions. Match the generated plane to the horizontal size of the
+        # imported SkyBox when one exists.
+        #
+        # cSea Hght is translated from the terrain/world height reference.
+        # Do not apply terrain mesh scale to Hght; Sandy's controlled WRL edit
+        # establishes the Sea height as a direct height value.
+        if sea_objects:
+            sea_size = SEA_DEFAULT_PLANE_SIZE
+            valid_skyboxes = [
+                obj for obj in skybox_objects
+                if obj.dimensions.x > 0.0 and obj.dimensions.y > 0.0
+            ]
+            if valid_skyboxes:
+                sea_size = max(
+                    max(float(obj.dimensions.x), float(obj.dimensions.y))
+                    for obj in valid_skyboxes
+                )
+
+            # Keep the Sea object's Blender scale at exactly 1.0.
+            # The previous implementation used object scale to match the
+            # imported SkyBox (e.g. 0.2, 0.2, 1.0 on Sandy).  We now bake
+            # that horizontal sizing into the mesh itself and make the Sea
+            # 50% of the previous SkyBox-derived size.
+            factor = sea_size / SEA_DEFAULT_PLANE_SIZE
+            mesh_factor = factor * 0.5
+            for sea_obj in sea_objects:
+                for vert in sea_obj.data.vertices:
+                    # build_sea() has already converted LR2 Y-up coordinates
+                    # to Blender Z-up, so X/Y are the horizontal axes here.
+                    vert.co.x *= mesh_factor
+                    vert.co.y *= mesh_factor
+                sea_obj.scale = (1.0, 1.0, 1.0)
+
+                h = float(sea_obj.get("lr2_sea_height", 0.0) or 0.0)
+                binding = (sea_obj.get("lr2_sea_binding") or "").strip()
+
+                # SEA HEIGHT CONVERSION:
+                # cSea Hght is expressed relative to the terrain's vertical
+                # scale. Controlled Sandy test:
+                #     Hght 127 / terrain Z scale 0.85 = 149.4118
+                # which matches the observed in-game Sea height.
+                #
+                # Do NOT parent the Sea to the terrain here. The terrain
+                # translation is not part of this conversion.
+                terrain_obj = terrain_objects[0] if terrain_objects else None
+                terrain_z_scale = (
+                    abs(float(terrain_obj.scale.z))
+                    if terrain_obj is not None and abs(float(terrain_obj.scale.z)) > 1e-8
+                    else 1.0
+                )
+                sea_z = h / terrain_z_scale
+
+                if self.convert_axes:
+                    sea_obj.location = convert_position((0.0, sea_z, 0.0))
+                else:
+                    sea_obj.location = (0.0, sea_z, 0.0)
+
+                print(
+                    f"[LR2 Import] Sea {sea_obj.name!r}: "
+                    f"Hght={h:.4f} / terrain_Z_scale={terrain_z_scale:.6f} "
+                    f"-> Blender Z={sea_obj.location.z:.4f}"
+                )
+
+            print(f"[LR2 Import] Sea plane size: {sea_size:.3f}")
+
+        # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: Sea sizing / height.
         # Second pass: resolve "binding" cross-references into real parenting
         # (e.g. CPspinner -> its CPfloater). Done after everything is placed
         # so file order doesn't matter. World-space transform is preserved
@@ -1193,11 +2572,21 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
 
     def draw(self, context):
         layout = self.layout
+
+        # [Fluffy Cupcake, 18.09.2026] CHANGED: show the auto-detected Game Data root in the import panel (next 5 lines).
+        # Show the inferred root immediately after a WRL has been selected.
+        # A manually entered path is never overwritten.
+        if not self.gamedata_dir and self.filepath:
+            inferred = infer_gamedata_root_from_wrl(self.filepath)
+            if inferred:
+                self.gamedata_dir = inferred
+
         layout.prop(self, "gamedata_dir")
         layout.prop(self, "convert_axes")
         layout.prop(self, "import_terrain")
         layout.prop(self, "skip_the_pits")
-        layout.prop(self, "skip_plasball")
+        # [Fluffy Cupcake, 18.09.2026] CHANGED: was layout.prop(self, "skip_plasball").
+        layout.prop(self, "skip_races")
         layout.prop(self, "group_zone_pairs")
 
 
