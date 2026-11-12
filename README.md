@@ -14,6 +14,13 @@ system.
 
 ## Change Notes
 
+v1.4.0
+
+- Unified terrain material (single material for the whole terrain) and optional terrain collision copy
+- Objects are sorted into the game's layer sets (Static, Track N, Bonus, Battle, Foyer, Explore) read from the WRL's layer manager, with the object class as second level; "Skip Layer Sets" options
+- cCheckPoint support, optional special markers (start positions etc.)
+- Import panel reorganised into sections; "Group Paired Layers into Zones" and the layer-detection based "Skip Races" were replaced
+
 v1.3.0 - Changes by Fluffy Cupcake:
 
 - Supports land patches (cPatch)
@@ -44,13 +51,8 @@ v1.3.0 - Changes by Fluffy Cupcake:
 - Alpha/transparency handling that follows the original engine's per-material
   `alpha_type` (cutout / soft blend / additive-approximated), instead of a
   one-size-fits-all transparency mode.
-- Organizes imported objects into Collections by the WRL's `layer` field,
-  with an option to further group layer pairs that share a "zone" (layers
-  differing by bit `0x200000`) under a common parent Collection.
 - Resolves the WRL's `binding` cross-references into real Blender parent/child
   relationships (e.g. checkpoint decorations parented to their checkpoint).
-- Per-import options to skip specific entity types/objects (e.g. `cThePits`,
-  `plasball` pickups).
 
 ![Demo3](pics/Screen7.gif)
 
@@ -58,12 +60,13 @@ v1.3.0 - Changes by Fluffy Cupcake:
 
 ## Requirements
 
-- v1.0.0 was developed and tested on **Blender 3.2**; later 3.x and 4.x
-  versions should theoretically work but have not been verified.
-- v1.3.0 was tested on **Blender 4.5.14 LTS**, aswell as other 4.X and 5.X versions
 - A legally owned copy of LEGO Racers 2, with its `GAMEDATA.GTC` archive
   already extracted (e.g. via [UNGTC](https://github.com/JrMasterModelBuilder/UNGTC))
   into a folder on disk.
+- v1.0.0 was developed and tested on **Blender 3.2**; later 3.x and 4.x
+  versions should theoretically work but have not been verified.
+- v1.3.0 was tested on **Blender 4.5.14 LTS**, aswell as other 4.X and 5.X versions
+- v1.4.0 was tested on **Blender 5.2**
 
 ## Installation
 
@@ -78,17 +81,19 @@ v1.3.0 - Changes by Fluffy Cupcake:
 
 ![Demo01](pics/Screen01.png)
 
-In the import options panel (bottom-left of the file browser), set:
 
+## Import Options
 
-| Option                             | Description                                                                                                 |
-| ---------------------------------- | ----------------------------------------------------------------------------------------------------------- |
-| **GAMEDATA Folder**                | Root of your extracted game data. Required.                                                                 |
-| **Convert Axes**                   | Converts LR2's Y-up coordinate system to Blender's Z-up. Leave on unless you have a specific reason not to. |
-| **Import Terrain**                 | Also imports the level's terrain heightmap.                                                                 |
-| **Skip 'The Pits' Objects**        | Excludes `cThePits` entities.                                                                               |
-| **Skip Plasball Pickups**          | Excludes weapon pickup objects named "plasball".                                                            |
-| **Group Paired Layers into Zones** | Nests `Layer_<n>` collections that appear to share a route/zone under a common `Zone_<n>` collection.       |
+| Option                       | Description                                                                                                                                                                                                                   |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **GAMEDATA Folder**          | Root of your extracted game data. Detected automatically from the selected `.wrl` if left empty.                                                                                                                              |
+| **Skip Layer Sets**          | Skips whole layer sets on import: **All** (everything, including Static; only the terrain is still imported), **Static**, **Races** (all `Track N` sets), **Bonus**, **Battle**, **Foyer** and **Explore**. The individual options are disabled while *All* is on. The terrain is never affected, see *Import Terrain*. |
+| **Import Terrain**           | Also imports the level's terrain heightmap.                                                                                                                                                                                   |
+| **Unified Terrain Material** | Uses one material for the whole terrain instead of one per texture combination (e.g. ~75 on Sandy Bay). On by default.                                                                                                       |
+| **Convert Axes**             | *(Misc)* Converts LR2's Y-up coordinate system to Blender's Z-up. Leave on unless you have a specific reason not to.                                                                                                          |
+| **Skip 'The Pits' Objects**  | *(Misc)* Excludes `cThePits` entities.                                                                                                                                                                                        |
+| **Import Special Markers**   | *(Misc)* Imports model-less entities (race and foyer start positions, cinematic cameras, reverb gateways) as Empties. Off by default.                                                                                         |
+| **Terrain Collision Copy**   | *(Misc)* Adds a hidden, geometry-only copy of the terrain (`<terrain>_collision`) whose triangles use materials `COL_TEXTURE<n>` by dominant texture, e.g. for assigning collision types. Off by default.                    |
 
 
 
@@ -114,22 +119,6 @@ In the import options panel (bottom-left of the file browser), set:
 
 ![Demo1](pics/Screen8.gif)
 
-## Known limitations
-
-
-- **Models use only their first (dominant) texture layer** — MDL2 render
-  groups support up to 4 blended texture layers like terrain does, but
-  this addon currently only samples the first one. Terrain, which needed
-  real blending to look right, does implement the full 4-layer blend.
-- **`alpha_type == 4` (additive blending)** is approximated with regular
-  alpha blending, since Blender's classic EEVEE material system has no
-  direct equivalent to Godot's additive blend mode used as the reference.
-- **Zone/route grouping (paired layer values differing by `0x200000`) is an
-  empirically observed pattern**, not a documented/confirmed format
-  feature — it held up consistently across everything tested, but treat it
-  as a heuristic.
-- **`binding` cross-references are resolved by exact name match** and
-  assume names are unique within a given `.wrl` file.
 
 ## Credits & sources
 
