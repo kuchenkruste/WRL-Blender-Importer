@@ -60,6 +60,8 @@
 # (18 September 2026) and carries version number 1.3.0 as a result.
 # Every modified or added passage is marked in the source with a comment
 # containing "[Fluffy Cupcake, 18.09.2026]" (CHANGED / BEGIN ... END).
+# Further modifications by Kuchenkruste of 11.11.2026 and 12.11.2026 are marked
+# "[Kuchenkruste, 11.11.2026]" / "[Kuchenkruste, 12.11.2026]".
 #
 # Changes by Fluffy Cupcake:
 #   * Supports land patches (cPatch)
@@ -78,13 +80,25 @@
 #   * Model parse/"not found" messages are now only logged for cPatch models
 #
 #   NOTE: According to the author, only tested with Blender 4.5.14 LTS
+#
+# Changes by Kuchenkruste (11.11.2026 / 12.11.2026):
+#   * Unified terrain material (single material for the whole terrain) and
+#     optional terrain collision copy
+#   * Objects are sorted into the game's layer sets (Static, Track N, Bonus,
+#     Battle, Foyer, Explore) read from the WRL's layer manager, with the
+#     object class as second level; "Skip Layer Sets" options
+#   * cCheckPoint support, optional special markers (start positions etc.)
+#   * Import panel reorganised into sections; "Group Paired Layers into
+#     Zones" and the layer-detection based "Skip Races" were replaced
+#
+#   NOTE: Tested with Blender 5.2
+#   
 # ==========================================================================
 
 bl_info = {
     "name": "LEGO Racers 2 World Importer",
     "author": "Kuchenkruste",
-    # [Fluffy Cupcake, 18.09.2026] CHANGED: version 1.0.0 -> 1.3.0; "description" below was also rewritten (WaterCourse).
-    "version": (1, 3, 0),
+    "version": (1, 4, 0),
     "blender": (3, 2, 0),
     "location": "File > Import > LEGO Racers 2 World (.wrl)",
     "description": "Imports LR2 .wrl worlds (models + terrain + textures) directly, "
@@ -291,6 +305,18 @@ _reg("cGoldenBrick", 1, _STATIC_PROPS, "model")
 _reg("cBonusVortex", 1, _STATIC_PROPS + [("difficulty", "int", None)], "model")
 _reg("cThePits", 1, _STATIC_PROPS + [("_3", "float", None)], "model")
 _reg("cWeaponPickup", 1, _STATIC_PROPS + [("_3", "float", None)], "model")
+# >>> [Kuchenkruste, 11.11.2026] BEGIN of added/changed code: cCheckPoint (derived from cGeneralStatic; verified against SANDY.WRL).
+# The "binding" slot holds the owning "CP Supervisor Track N"; body+0xDC is the checkpoint order index.
+_reg("cCheckPoint", 0, _STATIC_PROPS + [("checkpoint_index", "int", None)], "model")
+
+# Entities without a model that share the layout [layer][name][binding][position][quaternion]
+# (checked in SANDY.WRL). They are imported as Empties ("markers") so they appear in the layer hierarchy.
+_MARKER_PROPS = [("binding", "string", 24), ("position", "vec3", None), ("rotation", "quat", None)]
+MARKER_TYPES = ("cRaceStartPos", "cFoyerStartPos", "cCinematicCamera", "cReverbGateway")
+for _t in MARKER_TYPES:
+    for _u in range(0, 6):
+        WRL_FORMATS[(_t, _u)] = {"props": COMMON_PROPS + _MARKER_PROPS, "model": None, "marker": True}
+# <<< [Kuchenkruste, 11.11.2026] END of added/changed code.
 
 _MOBILE_PROPS = [
     ("binding", "string", 24), ("position", "vec3", None), ("rotation", "quat", None),
@@ -534,6 +560,38 @@ def _parse_cwatercourse(f, next_chunk):
     return props
 
 # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: cPatch / cWaterCourse parsers.
+# >>> [Kuchenkruste, 11.11.2026] BEGIN of added/changed code: cLayerManager ("ceLayerManager") layer sets.
+# Verified against SANDY.WRL / ARCTIC.WRL: 10 named sets; names at body+0x438 (10 x 24 bytes),
+# 256-bit masks at body+0x2F8 (10 x 32 bytes). The engine instantiates an entity of a set when bit
+# ((layer >> 5) & 0xFF) of the set's mask is set (World_InstantiateLayerSet in LEGO Racers 2.exe).
+LM_MASKS_OFFSET = 0x2F8
+LM_NAMES_OFFSET = 0x438
+LM_SET_COUNT = 10
+
+
+def layer_index(layer_value):
+    return (int(layer_value) >> 5) & 0xFF
+
+
+def _parse_clayermanager(f, next_chunk):
+    start = f.tell()
+    body = f.read(next_chunk - start)
+    props = {"layer": struct.unpack_from("<I", body, 0)[0] if len(body) >= 4 else 0,
+             "name": body[4:28].split(b"\x00", 1)[0].decode("utf-8", errors="replace") if len(body) >= 28 else ""}
+    sets = []
+    if len(body) >= LM_NAMES_OFFSET + LM_SET_COUNT * 24:
+        for i in range(LM_SET_COUNT):
+            raw = body[LM_NAMES_OFFSET + i * 24: LM_NAMES_OFFSET + (i + 1) * 24]
+            name = raw.split(b"\x00", 1)[0].decode("utf-8", errors="replace")
+            mask = body[LM_MASKS_OFFSET + i * 32: LM_MASKS_OFFSET + (i + 1) * 32]
+            bits = {k for k in range(256) if (mask[k // 8] >> (k % 8)) & 1}
+            if name:
+                sets.append((name, bits))
+    props["layer_sets"] = sets
+    return props
+# <<< [Kuchenkruste, 11.11.2026] END of added/changed code.
+
+
 def parse_wrl(path):
     entities = []
     with open(path, "rb") as f:
@@ -562,6 +620,8 @@ def parse_wrl(path):
                 props = _parse_cpatch(f, next_chunk)
             elif type_id == "cWaterCourse":
                 props = _parse_cwatercourse(f, next_chunk)
+            elif type_id == "cLayerManager":
+                props = _parse_clayermanager(f, next_chunk)
             elif spec is not None:
                 for name, kind, length_arg in spec["props"]:
                     props[name] = _read_prop(f, kind, length_arg)
@@ -970,6 +1030,10 @@ def parse_tdf(terrdata_path, terrain_dir=None):
                     break
                 terrain_tex_paths[i] = str(candidate)
 
+        # >>> [Kuchenkruste, 11.11.2026] BEGIN of added/changed code: global texture numbers (TEXTURE<n>.MIP, 1-based) of the resolved slots.
+        terrain_tex_ids = [tex_key[i] + 1 for i in range(4) if terrain_tex_paths[i]]
+        # <<< [Kuchenkruste, 11.11.2026] END of added/changed code.
+
         texture_label = f"blend_{'_'.join(str(t) for t in tex_key)}"
         if terrain_tex_paths[0]:
             texture_label = terrain_tex_paths[0]
@@ -979,6 +1043,8 @@ def parse_tdf(terrdata_path, terrain_dir=None):
                 "vertices": verts, "normals": surf["normals"], "uvs": surf["uvs"], "indices": indices,
                 "fill_type": 0, "texture": texture_label, "material": None,
                 "mix_weights": surf["mix_weights"], "terrain_tex_paths": terrain_tex_paths,
+                # [Kuchenkruste, 11.11.2026] CHANGED: new key "terrain_tex_ids" (used by the experimental terrain options only).
+                "terrain_tex_ids": terrain_tex_ids,
             }
         )
     return surfaces
@@ -1419,6 +1485,163 @@ def build_terrain_material(cache, image_cache, tex_paths):
 
     cache[key] = mat
     return mat
+
+
+# >>> [Kuchenkruste, 11.11.2026] BEGIN of added/changed code: experimental terrain helpers (unified material, collision copy).
+TERRAIN_WEIGHT_PREFIX = "TerrainW_"
+COLLISION_MATERIAL_PREFIX = "COL_TEXTURE"
+
+
+def terrain_weight_attr_name(tex_id):
+    return f"{TERRAIN_WEIGHT_PREFIX}{tex_id}"
+
+
+def collect_terrain_textures(surfaces):
+    """Returns {texture number: absolute path} for all textures used by the
+    given terrain surfaces (texture number = n in TEXTURE<n>.MIP)."""
+    result = {}
+    for surf in surfaces:
+        ids = surf.get("terrain_tex_ids") or []
+        paths = [p for p in (surf.get("terrain_tex_paths") or []) if p]
+        for tex_id, path in zip(ids, paths):
+            result.setdefault(tex_id, path)
+    return result
+
+
+def build_unified_terrain_material(cache, image_cache, tex_paths_by_id):
+    """One material for the whole terrain: every terrain texture gets one
+    Image Texture node (named TEXTURE<n>) weighted by a per-vertex float
+    attribute (TerrainW_<n>); ALBEDO = sum(tex_n * w_n), like the original
+    engine's terrain shader. Re-texturing = swap the image in one node."""
+    key = ("terrain_unified", tuple(sorted(tex_paths_by_id.items())))
+    if key in cache:
+        return cache[key]
+
+    mat = bpy.data.materials.new("LR2_terrain_unified")
+    mat.use_nodes = True
+    nodes = mat.node_tree.nodes
+    links = mat.node_tree.links
+    bsdf = nodes.get("Principled BSDF")
+
+    sum_socket = None
+    y = 0
+    for tex_id in sorted(tex_paths_by_id):
+        img = load_image_cached(image_cache, Path(tex_paths_by_id[tex_id]))
+        if img is None:
+            continue
+
+        attr_node = nodes.new("ShaderNodeAttribute")
+        attr_node.attribute_type = "GEOMETRY"
+        attr_node.attribute_name = terrain_weight_attr_name(tex_id)
+        attr_node.location = (-700, y)
+
+        tex_node = nodes.new("ShaderNodeTexImage")
+        tex_node.image = img
+        tex_node.name = f"TEXTURE{tex_id}"
+        tex_node.label = f"TEXTURE{tex_id}"
+        tex_node.location = (-500, y)
+
+        scale_node = nodes.new("ShaderNodeVectorMath")
+        scale_node.operation = "SCALE"
+        scale_node.location = (-250, y)
+        links.new(tex_node.outputs["Color"], scale_node.inputs[0])
+        links.new(attr_node.outputs["Fac"], scale_node.inputs["Scale"])
+
+        if sum_socket is None:
+            sum_socket = scale_node.outputs[0]
+        else:
+            add_node = nodes.new("ShaderNodeVectorMath")
+            add_node.operation = "ADD"
+            add_node.location = (0, y)
+            links.new(sum_socket, add_node.inputs[0])
+            links.new(scale_node.outputs[0], add_node.inputs[1])
+            sum_socket = add_node.outputs[0]
+        y -= 260
+
+    # Alpha deliberately ignored, same reasoning as build_terrain_material().
+    if sum_socket is not None and bsdf:
+        links.new(sum_socket, bsdf.inputs["Base Color"])
+
+    cache[key] = mat
+    return mat
+
+
+def get_collision_material(cache, tex_id):
+    """Flat-colour material COL_TEXTURE<n> (one per terrain texture). Reused
+    by name so renamed/tuned materials survive re-imports."""
+    key = ("terrain_col", tex_id)
+    if key in cache:
+        return cache[key]
+    name = f"{COLLISION_MATERIAL_PREFIX}{tex_id}"
+    mat = bpy.data.materials.get(name)
+    if mat is None:
+        import colorsys
+        r, g, b = colorsys.hsv_to_rgb((tex_id * 0.61803398875) % 1.0, 0.65, 0.9)
+        mat = bpy.data.materials.new(name)
+        mat.diffuse_color = (r, g, b, 1.0)
+        mat.use_nodes = True
+        bsdf = mat.node_tree.nodes.get("Principled BSDF")
+        if bsdf is not None:
+            bsdf.inputs["Base Color"].default_value = (r, g, b, 1.0)
+    mat["lr2_texture_id"] = tex_id
+    cache[key] = mat
+    return mat
+
+
+def build_terrain_collision_object(name, surfaces, convert_axes, material_cache):
+    """Geometry-only copy of the terrain where every triangle gets the
+    COL_TEXTURE<n> material of its dominant texture (largest summed blend
+    weight over the triangle's three vertices; ties -> lower texture number)."""
+    all_ids = sorted(collect_terrain_textures(surfaces))
+    if not all_ids:
+        return None
+
+    mesh = bpy.data.meshes.new(name)
+    bm = bmesh.new()
+    mats = [get_collision_material(material_cache, t) for t in all_ids]
+    slot_of = {t: i for i, t in enumerate(all_ids)}
+    skipped = 0
+
+    for surf in surfaces:
+        verts_src = surf["vertices"]
+        weights_src = surf.get("mix_weights")
+        ids = surf.get("terrain_tex_ids") or []
+        tris = triangulate(surf["indices"], surf["fill_type"])
+        if not verts_src or not tris:
+            continue
+        if not ids or not weights_src:
+            skipped += len(tris)
+            continue
+
+        bm_verts = [bm.verts.new(convert_position(v) if convert_axes else v) for v in verts_src]
+        for a, b, c in tris:
+            try:
+                face = bm.faces.new((bm_verts[a], bm_verts[b], bm_verts[c]))
+            except ValueError:
+                continue
+            sums = [0.0] * len(ids)
+            for idx in (a, b, c):
+                w = weights_src[idx]
+                for s in range(len(ids)):
+                    sums[s] += w[s]
+            # Ties resolve to the lower texture number (independent of the chunk's slot order).
+            best = max(range(len(ids)), key=lambda s: (sums[s], -ids[s]))
+            face.material_index = slot_of[ids[best]]
+
+    # Drop vertices of cut-out (hole) quads, then weld the duplicated chunk-border vertices.
+    bmesh.ops.delete(bm, geom=[v for v in bm.verts if not v.link_faces], context="VERTS")
+    bmesh.ops.remove_doubles(bm, verts=bm.verts[:], dist=1e-5)
+    bm.to_mesh(mesh)
+    bm.free()
+    for mat in mats:
+        mesh.materials.append(mat)
+    if skipped:
+        log(f"[LR2 Import] Terrain collision: {skipped} triangles skipped (no resolvable texture).")
+
+    obj = bpy.data.objects.new(name, mesh)
+    obj["lr2_collision_source"] = name
+    return obj
+# <<< [Kuchenkruste, 11.11.2026] END of added/changed code: experimental terrain helpers.
 
 
 # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: build_sea (cSea), WaterCourse Bezier/grid construction (build_watercourse) and build_water_sheet (cWaterSheet).
@@ -1879,12 +2102,16 @@ def build_water_sheet(name, width, height, convert_axes, material_cache, image_c
 
 
 # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: build_sea / build_watercourse / build_water_sheet.
+# [Kuchenkruste, 11.11.2026] CHANGED: new parameter terrain_unified (experimental unified terrain material).
 def build_object(name, surfaces, convert_axes, material_cache, image_cache, gamedata_root,
-                  is_terrain=False, uv_scale=(1.0, 1.0)):
+                  is_terrain=False, uv_scale=(1.0, 1.0), terrain_unified=False):
     mesh = bpy.data.meshes.new(name)
     bm = bmesh.new()
     uv_layer = bm.loops.layers.uv.new()
-    color_layer = bm.loops.layers.color.new(TERRAIN_MIX_LAYER_NAME) if is_terrain else None
+    # [Kuchenkruste, 11.11.2026] CHANGED: the legacy TerrainMix layer is not created in unified mode; per-texture float weight layers are created instead.
+    color_layer = bm.loops.layers.color.new(TERRAIN_MIX_LAYER_NAME) if is_terrain and not terrain_unified else None
+    unified_paths = collect_terrain_textures(surfaces) if is_terrain and terrain_unified else {}
+    weight_layers = {t: bm.verts.layers.float.new(terrain_weight_attr_name(t)) for t in sorted(unified_paths)}
 
     all_normals = []  # per-mesh-vertex, filled in bm-vertex creation order
     face_material_pairs = []  # (bm.face, material) to assign after materials built
@@ -1910,7 +2137,18 @@ def build_object(name, surfaces, convert_axes, material_cache, image_cache, game
             nn = convert_direction(n) if convert_axes else n
             all_normals.append(nn)
 
-        if is_terrain:
+        # >>> [Kuchenkruste, 11.11.2026] BEGIN of added/changed code: per-vertex weights per global texture (unified mode).
+        if weight_layers:
+            ids = surf.get("terrain_tex_ids") or []
+            for i, bv in enumerate(bm_verts):
+                if i < len(weights_src):
+                    for slot, tex_id in enumerate(ids):
+                        bv[weight_layers[tex_id]] = weights_src[i][slot]
+        # <<< [Kuchenkruste, 11.11.2026] END of added/changed code.
+
+        if is_terrain and terrain_unified:
+            mat = build_unified_terrain_material(material_cache, image_cache, unified_paths)
+        elif is_terrain:
             mat = build_terrain_material(material_cache, image_cache, surf.get("terrain_tex_paths", []))
         else:
             mat = get_or_build_material(
@@ -2047,20 +2285,53 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
         description="Don't import cThePits entities",
         default=True,
     )
-    # [Fluffy Cupcake, 18.09.2026] CHANGED: replaces the former option "skip_plasball" ("Skip Plasball Pickups"); works via layer detection.
-    skip_races: BoolProperty(
-        name="Skip Races",
-        description="Skip all objects on layers identified by race-specific WRL entities",
+    # >>> [Kuchenkruste, 12.11.2026] BEGIN of added/changed code: "Skip Layer Sets" options (replace skip_races / group_zone_pairs / group_by_layer_sets).
+    # Layer-set grouping is always active. A skipped set is not imported; an object that also belongs to a
+    # non-skipped set (e.g. shared scenery) stays and is linked only into the non-skipped sets.
+    skip_all: BoolProperty(
+        name="All",
+        description="Skip every layer set including 'Static'. Only the terrain (see 'Import Terrain') is still imported",
         default=False,
     )
-    group_zone_pairs: BoolProperty(
-        name="Group Paired Layers into Zones",
-        description="Layer values observed in pairs differing by bit 0x200000 "
-                    "(e.g. 98 and 2097250) appear to represent gameplay-critical "
-                    "vs. decorative/pickup objects of the same route zone. When "
-                    "enabled, their Layer_<n> collections are nested under a "
-                    "shared Zone_<n> collection instead of sitting side by side.",
-        default=True,
+    skip_static: BoolProperty(
+        name="Static",
+        description="Skip the 'Static' layer set (always-loaded world objects). The terrain is not "
+                    "affected; it is controlled by 'Import Terrain'",
+        default=False,
+    )
+    skip_races: BoolProperty(
+        name="Races",
+        description="Skip all 'Track N' layer sets (checkpoints, start positions, AI, track scenery)",
+        default=False,
+    )
+    skip_bonus: BoolProperty(name="Bonus", description="Skip the 'Bonus' layer set", default=False)
+    skip_battle: BoolProperty(name="Battle", description="Skip the 'Battle' layer set", default=False)
+    skip_foyer: BoolProperty(name="Foyer", description="Skip the 'Foyer' layer set", default=False)
+    skip_explore: BoolProperty(name="Explore", description="Skip the 'Explore' layer set", default=False)
+    show_misc: BoolProperty(name="Misc", description="Show miscellaneous import options", default=False)
+    import_markers: BoolProperty(
+        name="Import Special Markers",
+        description="Import model-less entities (race/foyer start positions, cinematic cameras, "
+                    "reverb gateways) as Empties",
+        default=False,
+    )
+    # <<< [Kuchenkruste, 12.11.2026] END of added/changed code.
+
+    exp_unified_terrain_material: BoolProperty(
+        name="Unified Terrain Material",
+        description="Use ONE material for the whole terrain instead of one per texture combination "
+                    "(Sandy Bay: ~75 materials). Blend weights are stored as per-vertex float "
+                    "attributes 'TerrainW_<n>' (n = TEXTURE<n>.MIP); each texture is a single, "
+                    "swappable Image Texture node named TEXTURE<n>",
+        default=True,  # [Kuchenkruste, 12.11.2026] CHANGED: default was False
+    )
+    exp_terrain_collision_copy: BoolProperty(
+        name="Terrain Collision Copy",
+        description="Additionally create a geometry-only copy of the terrain ('<terrain>_collision') "
+                    "whose triangles are assigned to materials COL_TEXTURE<n> by their dominant "
+                    "texture. Intended for assigning collision types per texture. "
+                    "Hidden in the viewport and render by default",
+        default=False,
     )
 
     def execute(self, context):
@@ -2107,6 +2378,11 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
         collection_name = f"LR2_{Path(wrl_path).stem}"
         existing = bpy.data.collections.get(collection_name)
         if existing:
+            # [Kuchenkruste, 11.11.2026] CHANGED: also remove nested collections/objects of a previous import.
+            for child in list(existing.children_recursive):
+                for obj in list(child.objects):
+                    bpy.data.objects.remove(obj, do_unlink=True)
+                bpy.data.collections.remove(child)
             for obj in list(existing.objects):
                 bpy.data.objects.remove(obj, do_unlink=True)
             bpy.data.collections.remove(existing)
@@ -2116,6 +2392,7 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
         material_cache = {}
         image_cache = {}  # resolved absolute texture path -> bpy.Image (shared, avoids re-decoding)
         model_cache = {}  # model_ref -> template bpy.types.Object (unlinked)
+        collision_cache = {}  # [Kuchenkruste, 11.11.2026] CHANGED: model_ref -> terrain collision template (experimental option)
         layer_collections = {}  # layer int -> bpy.types.Collection (sub-collection of `collection`)
         zone_collections = {}  # zone id (layer with bit 0x200000 stripped) -> bpy.types.Collection
         name_to_obj = {}  # entity name -> placed instance (for binding/parenting resolution)
@@ -2128,75 +2405,91 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
 
         ZONE_FLAG = 0x200000
 
-        # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: race layer detection for the "Skip Races" option.
-        # Race filtering is layer-based. Generic static/mobile objects are
-        # not classified by their names. Once a layer is identified as a race
-        # layer, every object on that layer is skipped.
-        RACE_ENTITY_TYPES = {
-            "cRaceStartPos",
-            "cCheckPoint",
-            "cCheckPointSupervisor",
-            "cAISupervisor",
-            "cAIQuad",
-            "cAISection",
-        }
+        # >>> [Kuchenkruste, 11.11.2026] BEGIN of added/changed code: layer-set hierarchy (set -> class collections).
+        layer_sets = []
+        for _e in entities:
+            if _e.type_id == "cLayerManager":
+                layer_sets = _e.props.get("layer_sets", [])
+                break
+        # Sets whose mask covers (almost) every index are unused placeholders (Sandy "Track 5/6"):
+        # skip them, otherwise every object would be linked into them as well.
+        active_sets = [(n, b) for n, b in layer_sets if 0 < len(b) < 24]
+        use_sets = bool(active_sets)  # layer-set grouping is always on when the WRL has a layer manager
+        # >>> [Kuchenkruste, 12.11.2026] BEGIN of added/changed code: layer-set skipping + static dedupe.
+        def skipped_set(name):
+            if self.skip_all:
+                return True
+            low = name.lower()
+            if low.startswith("track"):
+                return self.skip_races
+            return {
+                "static": self.skip_static,
+                "bonus": self.skip_bonus, "battle": self.skip_battle,
+                "foyer": self.skip_foyer, "explore": self.skip_explore,
+            }.get(low, False)
 
-        # Verified layer families from the real WRLs.  The 0x2000 variants are
-        # important for GeneralMobile checkpoint assets (for example, 0x62
-        # has a corresponding 0x2062 representation).  0x200000 is the
-        # existing paired-layer flag.
-        VERIFIED_RACE_BASE_LAYERS = {
-            "sandy": {0x20, 0x22, 0x40, 0x42, 0x60, 0x62, 0x80, 0x82},
-            "dino":  {0x20, 0x22, 0x40, 0x42, 0x60, 0x62, 0x80, 0x82, 0xA0, 0xA2},
-            "mars":  {0x20, 0x22, 0x40, 0x42, 0x60, 0x62, 0x80, 0x82, 0xA0, 0xA2},
-            "arctic": {0x20, 0x22, 0x40, 0x42, 0x60, 0x62, 0x80, 0x82, 0xA0, 0xA2},
-            "carcraze": {
-                0x20, 0x22, 0x40, 0x42, 0x60, 0x62, 0x80, 0x82,
-                0xA0, 0xA2, 0xC0, 0xC2, 0xE0, 0xE2, 0x120, 0x122,
-            },
-        }
+        def target_sets(e):
+            """Layer sets an entity is placed in (after skipping). Objects of the always-loaded
+            'Static' set are placed only there. Empty list = entity is skipped."""
+            idx = layer_index(e.layer)
+            names = [n for n, b in active_sets if idx in b]
+            if "Static" in names:
+                names = ["Static"]
+            if not names:
+                names = ["Unassigned"]
+            if e.type_id == "cLegoTerrain":  # terrain is only controlled by "Import Terrain"
+                return names
+            return [n for n in names if not skipped_set(n)]
+        # <<< [Kuchenkruste, 12.11.2026] END of added/changed code.
+        set_collections = {}
+        class_collections = {}
+        stem = Path(wrl_path).stem
 
-        world_key = Path(wrl_path).stem.lower()
-        base_layers = set(VERIFIED_RACE_BASE_LAYERS.get(world_key, set()))
+        def _set_collection(set_name):
+            c = set_collections.get(set_name)
+            if c is None:
+                c = bpy.data.collections.new(f"{stem} | {set_name}")
+                collection.children.link(c)
+                set_collections[set_name] = c
+            return c
 
-        if base_layers:
-            # Build the exact observed representations of each base race
-            # layer. Do not generate arbitrary +/- layer IDs.
-            race_layers = set(base_layers)
-            race_layers.update(layer ^ 0x2000 for layer in base_layers)
-            race_layers.update(layer ^ ZONE_FLAG for layer in base_layers)
-            race_layers.update((layer ^ 0x2000) ^ ZONE_FLAG for layer in base_layers)
-        else:
-            # Unknown world: discover only the actual race-control layers
-            # present in the WRL and their existing paired-zone layers.
-            race_layers = {
-                entity.layer
-                for entity in entities
-                if entity.type_id in RACE_ENTITY_TYPES
-            }
-            race_layers |= {layer ^ ZONE_FLAG for layer in race_layers}
+        if use_sets:
+            for _n, _b in active_sets:  # create in layer-manager order
+                if not skipped_set(_n) or (_n == "Static" and self.import_terrain):
+                    _set_collection(_n)
 
-        if self.skip_races:
-            print(
-                "[LR2 Import] Skip Races layers: "
-                + ", ".join(f"{layer} ({layer:#x})" for layer in sorted(race_layers))
-            )
+        def _class_collection(set_name, class_name):
+            key = (set_name, class_name)
+            c = class_collections.get(key)
+            if c is None:
+                c = bpy.data.collections.new(f"{set_name} / {class_name}")
+                _set_collection(set_name).children.link(c)
+                class_collections[key] = c
+            return c
 
-        # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: race layer detection.
+        def link_entity(e, inst):
+            """Link inst into the collection(s) of every layer set containing the entity's layer index."""
+            idx = layer_index(e.layer)
+            inst["lr2_class"] = e.type_id
+            inst["lr2_layer"] = int(e.layer)
+            inst["lr2_layer_index"] = idx
+            if "checkpoint_index" in e.props:
+                inst["lr2_checkpoint_index"] = int(e.props["checkpoint_index"])
+            if not use_sets:
+                get_layer_collection(e.layer).objects.link(inst)
+                return
+            names = target_sets(e)
+            inst["lr2_layer_sets"] = ", ".join(names)
+            for n in names:
+                _class_collection(n, e.type_id).objects.link(inst)
+        # <<< [Kuchenkruste, 11.11.2026] END of added/changed code.
+
         def get_layer_collection(layer_value):
             coll = layer_collections.get(layer_value)
             if coll is not None:
                 return coll
 
-            parent_coll = collection
-            if self.group_zone_pairs:
-                zone_id = layer_value & ~ZONE_FLAG
-                zone_coll = zone_collections.get(zone_id)
-                if zone_coll is None:
-                    zone_coll = bpy.data.collections.new(f"Zone_{zone_id}")
-                    collection.children.link(zone_coll)
-                    zone_collections[zone_id] = zone_coll
-                parent_coll = zone_coll
+            parent_coll = collection  # [Kuchenkruste, 12.11.2026] zone grouping removed (superseded by layer sets)
 
             coll = bpy.data.collections.new(f"Layer_{layer_value}")
             parent_coll.children.link(coll)
@@ -2205,16 +2498,11 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
 
 
         for e in entities:
-            # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: Skip Races check (replaces the former skip_plasball check further below; plasball objects are still skipped).
-            if self.skip_races and (
-                e.layer in race_layers
-                or "plasball" in str(e.name or "").lower()
-                or "plasball" in str(e.props.get("model", "") or "").lower()
-            ):
+            # [Kuchenkruste, 12.11.2026] CHANGED: Skip Layer Sets (replaces the former layer-detection based "Skip Races").
+            if use_sets and e.type_id != "cLayerManager" and not target_sets(e):
                 skipped += 1
                 continue
 
-            # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: Skip Races check.
             # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: cSea import.
             # cSea is the global ocean surrounding the islands. It has no
             # finite geometry dimensions in the WRL, so generate a large plane.
@@ -2236,7 +2524,7 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
                     gamedata_root,
                     self.sea_texture_tiles,
                 )
-                get_layer_collection(e.layer).objects.link(inst)
+                link_entity(e, inst)  # [Kuchenkruste, 11.11.2026] CHANGED: was get_layer_collection(e.layer).objects.link(inst)
                 inst["lr2_sea_height"] = sea_height
                 inst["lr2_sea_rise_lower"] = float(e.props.get("sea_rise_lower", 0.0) or 0.0)
                 inst["lr2_sea_fade_distance"] = float(e.props.get("sea_fade_distance", 0.0) or 0.0)
@@ -2281,7 +2569,7 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
                     material_cache, image_cache, water_texture,
                     reflection_texture, gamedata_root
                 )
-                get_layer_collection(e.layer).objects.link(inst)
+                link_entity(e, inst)  # [Kuchenkruste, 11.11.2026] CHANGED: was get_layer_collection(e.layer).objects.link(inst)
 
                 pos = e.props.get("position", (0.0, 0.0, 0.0))
                 rot = e.props.get("rotation", (0.0, 0.0, 0.0, 1.0))
@@ -2329,7 +2617,7 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
                         e.props.get("bed_texture", ""),
                         gamedata_root,
                     )
-                    get_layer_collection(e.layer).objects.link(inst)
+                    link_entity(e, inst)  # [Kuchenkruste, 11.11.2026] CHANGED: was get_layer_collection(e.layer).objects.link(inst)
                     inst["lr2_watercourse_course_ref"] = tuple(e.props.get("course_ref", (0.0, 0.0, 0.0)))
                     inst["lr2_watercourse_binding"] = (e.props.get("binding") or "").strip()
                     log(f"[LR2 Import] PLACED cWaterCourse name={inst.name!r} layer={e.layer} "
@@ -2348,6 +2636,28 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
 
             # <<< [Fluffy Cupcake, 18.09.2026] END of added/changed code: cWaterCourse import.
             # >>> [Fluffy Cupcake, 18.09.2026] BEGIN of added/changed code: cPatch (land patch) model reference handling, skipped-counter logic, is_patch flag; the old skip_plasball check was removed here.
+            # >>> [Kuchenkruste, 11.11.2026] BEGIN of added/changed code: marker entities (no model) -> Empties.
+            _mspec = WRL_FORMATS.get((e.type_id, e.u))
+            if _mspec is not None and _mspec.get("marker"):
+                if not self.import_markers:
+                    continue
+                inst = bpy.data.objects.new(e.name or e.type_id, None)
+                inst.empty_display_type = "ARROWS"
+                inst.empty_display_size = 2.0
+                link_entity(e, inst)  # [Kuchenkruste, 11.11.2026] CHANGED: was get_layer_collection(e.layer).objects.link(inst)
+                pos = e.props.get("position", (0.0, 0.0, 0.0))
+                rot = e.props.get("rotation", (0.0, 0.0, 0.0, 1.0))
+                if self.convert_axes:
+                    pos = convert_position(pos)
+                    rot = convert_rotation(rot)
+                inst.location = pos
+                inst.rotation_mode = "QUATERNION"
+                x, y, z, w = rot
+                inst.rotation_quaternion = (w, x, y, z)
+                inst["lr2_binding"] = (e.props.get("binding") or "").strip()
+                placed += 1
+                continue
+            # <<< [Kuchenkruste, 11.11.2026] END of added/changed code.
             spec = WRL_FORMATS.get((e.type_id, e.u))
             if e.type_id == "cPatch":
                 model_ref = e.props.get("model")
@@ -2423,7 +2733,18 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
                     template = build_object(
                         obj_name, surfaces, self.convert_axes, material_cache, image_cache, gamedata_root,
                         is_terrain=is_terrain, uv_scale=uv_scale,
+                        # [Kuchenkruste, 11.11.2026] CHANGED: terrain_unified (experimental).
+                        terrain_unified=is_terrain and self.exp_unified_terrain_material,
                     )
+                    # >>> [Kuchenkruste, 11.11.2026] BEGIN of added/changed code: experimental terrain collision copy template.
+                    if is_terrain and self.exp_terrain_collision_copy:
+                        try:
+                            collision_cache[model_ref] = build_terrain_collision_object(
+                                f"{obj_name}_collision", surfaces, self.convert_axes, material_cache,
+                            )
+                        except Exception as ex:  # noqa: BLE001
+                            log(f"[LR2 Import] Terrain collision copy FAILED: {ex}\n{traceback.format_exc()}")
+                    # <<< [Kuchenkruste, 11.11.2026] END of added/changed code.
                 else:
                     template = None
                 model_cache[model_ref] = template
@@ -2439,7 +2760,7 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
             inst = template.copy()
             inst.data = template.data
             inst.name = e.name or e.type_id
-            get_layer_collection(e.layer).objects.link(inst)
+            link_entity(e, inst)  # [Kuchenkruste, 11.11.2026] CHANGED: was get_layer_collection(e.layer).objects.link(inst)
             # Keep the import log useful during reverse engineering without
             # dumping thousands of ordinary GeneralStatic placements.
             # [Fluffy Cupcake, 18.09.2026] CHANGED: additional cPatch diagnostics.
@@ -2460,6 +2781,25 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
             x, y, z, w = rot
             inst.rotation_quaternion = (w, x, y, z)
             inst.scale = scale
+            # >>> [Kuchenkruste, 11.11.2026] BEGIN of added/changed code: place the experimental terrain collision copy at the terrain's transform.
+            col_template = collision_cache.get(model_ref) if is_terrain else None
+            if col_template is not None:
+                col_inst = col_template.copy()
+                col_inst.data = col_template.data
+                col_inst.name = f"{inst.name}_collision"
+                for coll in inst.users_collection:
+                    coll.objects.link(col_inst)
+                col_inst.location = inst.location
+                col_inst.rotation_mode = "QUATERNION"
+                col_inst.rotation_quaternion = inst.rotation_quaternion
+                col_inst.scale = inst.scale
+                col_inst.hide_render = True
+                try:
+                    col_inst.hide_set(True)
+                except RuntimeError:
+                    col_inst.hide_viewport = True
+                log(f"[LR2 Import] Terrain collision copy placed: {col_inst.name!r}")
+            # <<< [Kuchenkruste, 11.11.2026] END of added/changed code.
             # [Fluffy Cupcake, 18.09.2026] CHANGED: cPatch diagnostics and custom properties (lr2_object_type, lr2_patch_model, lr2_patch_binding).
             if is_patch:
                 log(f"[LR2 Import] PATCH transform name={inst.name!r} location={tuple(inst.location)} "
@@ -2564,6 +2904,11 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
             inst.matrix_parent_inverse = parent_obj.matrix_world.inverted()
             parented += 1
 
+        # [Kuchenkruste, 11.11.2026] remove empty layer-set / class collections
+        for _c in list(class_collections.values()) + list(set_collections.values()):
+            if not _c.objects and not _c.children:
+                bpy.data.collections.remove(_c)
+
         self.report(
             {"INFO"},
             f"LR2 import done: {placed} placed ({parented} parented via binding), {skipped} skipped.",
@@ -2582,12 +2927,44 @@ class IMPORT_OT_lr2_world(bpy.types.Operator, ImportHelper):
                 self.gamedata_dir = inferred
 
         layout.prop(self, "gamedata_dir")
-        layout.prop(self, "convert_axes")
-        layout.prop(self, "import_terrain")
-        layout.prop(self, "skip_the_pits")
-        # [Fluffy Cupcake, 18.09.2026] CHANGED: was layout.prop(self, "skip_plasball").
-        layout.prop(self, "skip_races")
-        layout.prop(self, "group_zone_pairs")
+
+        # >>> [Kuchenkruste, 12.11.2026] BEGIN of added/changed code: sectioned import panel.
+        box = layout.box()
+        box.label(text="Skip Layer Sets")
+        col = box.column(align=True)
+        col.prop(self, "skip_all")
+        sub = col.column(align=True)
+        sub.enabled = not self.skip_all
+        sub.prop(self, "skip_static")
+        sub.prop(self, "skip_races")
+        sub.prop(self, "skip_bonus")
+        sub.prop(self, "skip_battle")
+        sub.prop(self, "skip_foyer")
+        sub.prop(self, "skip_explore")
+
+        box = layout.box()
+        box.label(text="Terrain")
+        col = box.column(align=True)
+        col.prop(self, "import_terrain")
+        sub = col.column(align=True)
+        sub.enabled = self.import_terrain
+        sub.prop(self, "exp_unified_terrain_material")
+
+        box = layout.box()
+        box.prop(
+            self, "show_misc",
+            icon="TRIA_DOWN" if self.show_misc else "TRIA_RIGHT",
+            emboss=False,
+        )
+        if self.show_misc:
+            col = box.column(align=True)
+            col.prop(self, "convert_axes")
+            col.prop(self, "skip_the_pits")
+            col.prop(self, "import_markers")
+            sub = col.column(align=True)
+            sub.enabled = self.import_terrain
+            sub.prop(self, "exp_terrain_collision_copy")
+        # <<< [Kuchenkruste, 12.11.2026] END of added/changed code.
 
 
 def menu_func_import(self, context):
